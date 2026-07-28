@@ -89,11 +89,15 @@ class TestColdLoadHoist:
     async def test_get_or_create_host_is_async_and_caches(self, tmp_path: Path) -> None:
         engine = SylanneEngine(data_dir=tmp_path, llm=AsyncMock(return_value="ok"))
         await engine.start()
-        h1 = await engine._get_or_create_host("s1")
-        h2 = await engine._get_or_create_host("s1")
-        assert h1 is h2  # cached, one build
-        h3 = await engine._get_or_create_host("s2")
-        assert h3 is not h1  # distinct session
+        # v26: direct host access now requires an active session lease; hold one
+        # per session so the cold-load/caching semantics can be probed directly.
+        async with engine._session_lock("s1"):
+            h1 = await engine._get_or_create_host("s1")
+            h2 = await engine._get_or_create_host("s1")
+            assert h1 is h2  # cached, one build
+            async with engine._session_lock("s2"):
+                h3 = await engine._get_or_create_host("s2")
+                assert h3 is not h1  # distinct session
         await engine.shutdown()
 
     @pytest.mark.asyncio

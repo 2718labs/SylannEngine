@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 from dataclasses import dataclass
 from typing import Literal
 
@@ -195,6 +196,75 @@ def build_profile(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class BrainComputeConfig:
+    """Immutable configuration for the opt-in brain compute path."""
+
+    enabled: bool = False
+    c_enabled: bool = False
+    sparse_routing: bool = False
+    c_backend: str = "builtin"
+    c_authority: float = 0.0
+    c_residual_cap: float = 0.1
+    c_promoted: bool = False
+    c_timeout_ms: float = 30.0
+    feedback_horizon: int = 8
+    feedback_ttl_seconds: float = 7200.0
+    dedup_horizon: int = 256
+    hot_session_limit: int = 48
+
+    def __post_init__(self) -> None:
+        for field_name in ("enabled", "c_enabled", "sparse_routing", "c_promoted"):
+            if type(getattr(self, field_name)) is not bool:
+                raise ValueError(f"{field_name} must be bool")
+        if not isinstance(self.c_backend, str) or not self.c_backend:
+            raise ValueError("c_backend must be a nonempty string")
+        if not _finite_number(self.c_authority) or not (0.0 <= self.c_authority <= 0.1):
+            raise ValueError("c_authority must be finite and in [0.0, 0.1]")
+        if not _finite_number(self.c_residual_cap) or not (0.0 <= self.c_residual_cap <= 0.1):
+            raise ValueError("c_residual_cap must be finite and in [0.0, 0.1]")
+        if self.c_authority > self.c_residual_cap:
+            raise ValueError("c_authority must not exceed c_residual_cap")
+        if not _finite_number(self.c_timeout_ms) or self.c_timeout_ms <= 0:
+            raise ValueError("c_timeout_ms must be finite and > 0")
+        if not _bounded_int(self.feedback_horizon, minimum=1, maximum=32):
+            raise ValueError("feedback_horizon must be an integer in [1, 32]")
+        if not _finite_number(self.feedback_ttl_seconds) or self.feedback_ttl_seconds <= 0:
+            raise ValueError("feedback_ttl_seconds must be finite and > 0")
+        if not _bounded_int(self.dedup_horizon, minimum=1):
+            raise ValueError("dedup_horizon must be an integer >= 1")
+        if not _bounded_int(self.hot_session_limit, minimum=1):
+            raise ValueError("hot_session_limit must be an integer >= 1")
+        if not self.enabled:
+            if self.c_enabled:
+                raise ValueError("c_enabled requires enabled=True")
+            if self.sparse_routing:
+                raise ValueError("sparse_routing requires enabled=True")
+            if self.c_authority != 0.0:
+                raise ValueError("nonzero c_authority requires enabled=True")
+        # Promotion is the explicit operator sign-off that clears the canary gate
+        # (after the offline value-gate instrument passes). It only means anything
+        # if the C path is enabled and actually has authority to grant.
+        if self.c_promoted and (not self.enabled or self.c_authority <= 0.0):
+            raise ValueError("c_promoted requires enabled=True and c_authority > 0")
+
+
+def _finite_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        converted = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    return math.isfinite(converted)
+
+
+def _bounded_int(value: object, *, minimum: int, maximum: int | None = None) -> bool:
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        return False
+    return maximum is None or value <= maximum
+
+
 @dataclass(slots=True, frozen=True)
 class SylanneConfig:
     """Engine configuration options.
@@ -315,6 +385,7 @@ class SylanneConfig:
     submit_window_seconds: float = 10.0
     submit_max_entries: int = 1024
     tick_min_interval_seconds: float = 45.0
+    brain_compute: BrainComputeConfig = BrainComputeConfig()
 
     def __post_init__(self) -> None:
         if self.mode not in ("lite", "pro", "max"):
@@ -336,6 +407,25 @@ class SylanneConfig:
             raise ValueError("submit_max_entries must be >= 1")
         if self.tick_min_interval_seconds < 0:
             raise ValueError("tick_min_interval_seconds must be >= 0")
+        if not isinstance(self.brain_compute, BrainComputeConfig):
+            raise ValueError("brain_compute must be a BrainComputeConfig")
+        if self.brain_compute.enabled and self.mode != "lite":
+            raise ValueError("brain_compute requires mode='lite'")
+        if self.brain_compute.enabled:
+            legacy_writers = (
+                "pel_core_enabled",
+                "affect_dynamics_enabled",
+                "affect_takeover",
+                "affect_slowchannel_enabled",
+                "affect_plasticity_enabled",
+                "affect_full_takeover",
+            )
+            for field_name in legacy_writers:
+                if getattr(self, field_name):
+                    raise ValueError(
+                        f"brain_compute is not supported together with {field_name} "
+                        "(both write authoritative affect state)"
+                    )
         # affect flag compatibility: takeover writes base and needs the E-law machinery
         # (traits/adapter) that affect_dynamics_enabled turns on; it also cannot coexist
         # with PEL-Core, which independently OWNS base evolution (PEL's readout would

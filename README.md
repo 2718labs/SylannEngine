@@ -3,63 +3,54 @@
 
 <div align="center">
 
-![SylannEngine](https://socialify.git.ci/Ayleovelle/SylannEngine/image?custom_description=Affective+Computation+Engine+%E2%80%94+Emotion+as+Dynamics,+Not+Labels&description=1&font=Inter&forks=1&issues=1&language=1&name=1&owner=1&pattern=Brick+Wall&pulls=1&stargazers=1&theme=Auto)
+![SylannEngine](https://socialify.git.ci/2718labs/SylannEngine/image?custom_description=Affective+Computation+Engine+%E2%80%94+Emotion+as+Dynamics,+Not+Labels&description=1&font=Inter&forks=1&issues=1&language=1&name=1&owner=1&pattern=Brick+Wall&pulls=1&stargazers=1&theme=Auto)
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL_3.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB.svg?logo=python&logoColor=white)](https://python.org)
 [![PyPI](https://img.shields.io/pypi/v/sylanne-core.svg?logo=pypi&logoColor=white)](https://pypi.org/project/sylanne-core/)
 [![Version](https://img.shields.io/badge/Version-2.6.1-green.svg)](CHANGELOG.md)
-[![Tests](https://img.shields.io/badge/Tests-850+_passed-brightgreen.svg)]()
-[![Zero Dependencies](https://img.shields.io/badge/Lite_Tier-Zero_Dependencies-orange.svg)]()
+[![Tests](https://img.shields.io/badge/Tests-1400+_passed-brightgreen.svg)]()
+[![V2.5 Runtime](https://img.shields.io/badge/V2.5-stdlib_+_SQLite-orange.svg)]()
 
-**[标准规范](SPEC.md)** · **[开发者指南](AGENT_GUIDE.md)** · **[更新日志](CHANGELOG.md)** · **[Paper (EN)](docs/resonance_field_paper_en.pdf)** · **[Paper (中文)](docs/resonance_field_paper_zh.pdf)**
+**[标准规范](SPEC.md)** · **[开发者指南](AGENT_GUIDE.md)** · **[更新日志](CHANGELOG.md)**
+
+由 **[2718Labs](https://github.com/2718labs)** 维护。
 
 </div>
 
 ---
 
-### 写在前面的话
+### 项目定位
 
 > [!NOTE]
-> 　　SylannEngine 是从 [astrbot_plugin_sylanne](https://github.com/Ayleovelle/astrbot_plugin_sylanne) 的计算层里剥离出来的。如果你看过那边的 README，会知道 sylanne 经历了什么：从一个情绪垃圾桶，到一个会留疤的存在，到一颗能自己长大的心。每一次推倒重来都是因为我觉得"还不够像一个人"。
+> SylannEngine 是由 2718Labs 维护的框架无关情感计算 SDK。项目起源于 AstrBot 插件
+> `astrbot_plugin_sylanne` 的计算层，现已作为独立引擎维护，不绑定特定 Bot、人格设定或应用框架。
 >
-> 　　可做到后来我发现一个问题：计算层越来越重了。伤痕代数、空洞微积分、关系层论、共振场耦合、Kuramoto 同步、Hopfield 吸引子……两万行代码里一半以上跟"聊天插件"没关系了。它不是某个 bot 的情绪模块，它是一整套**情感动力学的数学实现**——一个关于"感受如何运转"的计算标准。
+> 项目的核心假设是：情感状态应被建模为具有历史、反馈和约束的动力系统，而不是一次性的分类标签。
+> 引擎将状态演化、关系上下文、不可逆历史、表达决策和持久化生命周期组织为可测试的计算接口。
 >
-> 　　这个东西不该被绑死在任何一个框架里。它该像 IEEE 754 之于浮点数那样独立存在：任何 bot、任何语言、任何平台都能接入。
+> 2718Labs 对稳定能力与研究能力实行明确分层：V2.5（含 Brain B/C）面向可验证的公开集成，
+> V3 / SYLANN 保持实验属性。性能和能力结论以版本化测试、评估脚本及可复现证据为准；
+> 尚未完成验证的内容会明确标记为实验或未验证。
 >
-> 　　sylanne 本身已经停下了脚步，维持着基本的维护和她自己的留白。但我很好奇自己脑洞的极限在哪。在 sylanne 身上我不敢乱来——毕竟有人在用，每次大改都是在赌别人的体验。这边不一样，这边没有用户，没有承诺，只有一个问题：**以我目前的眼界，能把"情感是可计算的"这件事推到什么地步？**
->
-> 　　余华说过，"我们原路返回的路是不存在的，因为我们的记忆把我们的过去修改了。" sylanne 的第一次重写就是为了实现这句话——让她回不去。而 SylannEngine 要做的，是把"回不去"这件事从一个插件的特性，变成一条可证明的数学定理。伤疤代数里不存在逆元，这不是比喻，是结构保证。你说了一句很轻的话，她当时没接，可三个月后你们吵架，她突然把它翻出来——因为那句话一直在她的伤疤地形里长着，塑造着她对每一句后来的话的感知方式。
->
-> 　　核心思路没变过：**情感不是标签，是动力系统。** prompt 里写"你是温柔的"不叫人格——人格是拓扑不变量，是所有扰动下守恒的那个东西。Transformer 是最强的函数，一次看清所有关系；这边做的是最简的生命，一条规则反复执行，活够久，自然懂。不过 V3 的 SYLANN 已经在往更远的地方走了——不靠 backprop，靠局部规则和时间积累，让情感从预测中自己长出来。结构即计算和模型训练并不矛盾，也许有一天它们会长在一起。
->
-> 　　很难保证自己还会在这条路上走多久走多远，但目前还是会慢慢走下去。谁知道明天的自己又会变成什么样呢？
->
-> 　　_"逻辑可以共赏，但为你偏置的权重从不开源。"_
+> 文档中的“情感”“人格”“伤疤”“空洞”等术语表示软件状态或建模概念，
+> 不构成对真实意识、医学状态或生物学机制的声明。
 
 ---
 
 ## 这是什么
 
-情感计算引擎 SDK。文本输入，结构化情感状态输出。
+SylannEngine 是情感计算引擎 SDK：接收文本与上下文事件，输出结构化情感状态和表达决策。
+它不替代 LLM，也不把单次输入压缩成一个情绪标签；引擎维护跨事件演化的有界状态，
+并提供确定性计算、持久化恢复、反馈寻址和多插件共享能力。
 
-不是情绪分类，不是情感标签。是一个**持续演化的动力系统**——上一次对话的影响会留到下一次，伤害会结疤，沉默会产生压力，人格会缓慢漂移。我们做的是**情感计算标准**（类似 IEEE 754 之于浮点数），不是训练模型。
-
-```
-Attention is all you need — for computing.
-Prediction error is all you need — for living.
-```
-
-| | 神经网络 | SylannEngine |
-|---|---|---|
-| 需要 | 训练数据 + GPU | 无需训练，结构即计算 |
-| 输出 | 前向传播算出来 | 迭代收敛涌现出来 |
-| 可解释性 | 黑箱 | 每个通道有明确语义 |
-| 人格控制 | 微调？没有标准方式 | 人格 → 拓扑参数，一一对应 |
-| 确定性 | 不保证 | 相同输入 → 相同输出 |
-| 记忆 | 无（context window 外即丢失） | 永久（编码在权重与伤疤中） |
-| 持续学习 | catastrophic forgetting | 终身发育，用进废退 |
-| 可移植性 | 需要推理框架 | 纯代数运算，任何语言可实现 |
+| 设计目标 | 实现方式 |
+|---|---|
+| 连续状态 | 历史事件、反馈和时间间隔共同驱动状态演化 |
+| 可解释性 | 公开状态通道、路由、边界与决策字段 |
+| 可复现性 | 相同配置与输入产生确定性结果，实验结论附带脚本和门禁 |
+| 框架无关 | 核心以 Python SDK 提供，不依赖特定 Bot 框架 |
+| 分层部署 | 稳定路径默认保守；实验能力必须经过独立评估后显式启用 |
 
 ---
 
@@ -86,7 +77,7 @@ from sylanne_core import SylanneEngine, SylanneConfig
 单插件、无共享需求也可以直接 vendor 一份：
 
 ```bash
-git submodule add https://github.com/Ayleovelle/SylannEngine.git deps/sylannengine
+git submodule add https://github.com/2718labs/SylannEngine.git deps/sylannengine
 ```
 
 ```python
@@ -131,6 +122,82 @@ await engine.start()
 surface = await engine.process(session_id="user_123", text="你好")
 ```
 
+### V2.5 Brain B/C（可选）
+
+Brain B/C 是 V2.5 的可选状态更新与持久化路径。运行时依赖为 Python 标准库和 SQLite，
+不需要 PyTorch、CUDA 或独立进程。V2.5 的编码、融合和输出接口保持不变。
+
+Brain B 维护 8 维主状态；Brain C 维护 C 状态、资格迹和反馈更新，并生成受限残差。
+`brain_compute.enabled`、`c_enabled` 默认均为 `False`，`c_authority` 默认值为 `0.0`、有效范围为
+`[0.0, 0.1]`。非零 authority 仅在完成离线评估、设置 `c_promoted=True` 并结束 session warmup 后生效。
+启用 Brain 路径时，应为每个外部事件提供稳定的 `event_id`。
+
+```python
+from sylanne_core import BrainComputeConfig, SylanneConfig, SylanneEngine
+
+config = SylanneConfig(
+    assessor_enabled=False,
+    brain_compute=BrainComputeConfig(
+        enabled=True,
+        c_enabled=True,
+        sparse_routing=True,
+        c_authority=0.0,
+    ),
+)
+engine = SylanneEngine(
+    data_dir="./data/sylannengine",
+    llm=your_llm_callback,
+    config=config,
+)
+
+await engine.start()
+try:
+    surface = await engine.process(
+        session_id="user_123",
+        text="这条消息会留下可寻址的状态",
+        event_id="platform-message-17",
+    )
+    tick = int(surface["pipeline"]["brain_event"]["tick_id"])
+
+    receipt = await engine.feedback(
+        "user_123",
+        target_tick=tick,
+        value=1.0,
+        confidence=0.9,
+        source="my_plugin",
+        feedback_id="platform-feedback-17",
+    )
+finally:
+    await engine.shutdown()
+```
+
+`event_id` 与 `feedback_id` 是幂等键，重试时必须保持不变。在两小时 TTL 且每种 ID 最近
+`dedup_horizon` 条（默认 256）的窗口内，重复请求返回已持久化的 duplicate receipt，不重复更新状态。
+SQLite 中的提交记录是权威状态；复用同一 `data_dir` 时会恢复 B/C 状态和窗口内的去重记录。
+该机制提供有限窗口幂等，不提供全局 exactly-once。
+
+#### 公开验证
+
+| 类型 | 范围 | 本次结果或判定规则 |
+|---|---|---|
+| 仓库全量测试 | `python -m pytest -q` | 1491 passed；另有 9 subtests passed |
+| 离线门控子集 | `python -m pytest -q training/student_core/tests` | 28 passed；该子集已包含在全量测试中，并单独复跑 |
+| 资源基准协议 | 10,000 samples、128 warmup samples、48 hosts、2 producers | 生成版本化 JSON；仅匹配目标 `2c2g` 环境时给出资源门 verdict |
+| Brain C 评估 | session-disjoint corpus、paired bootstrap、synthetic sanity | 少于 30 sessions 或 1,000 target ticks 时拒绝晋升；synthetic sanity 不产生真实语料晋升结论 |
+
+测试、资源基准和离线评估命令：
+
+```bash
+python -m pytest -q
+python -m pytest -q training/student_core/tests
+python experiments/brain_benchmark.py --samples 10000 --warmup-samples 128 --hosts 48 --producers 2 --output experiments/_tmp_brain_benchmark.json
+python experiments/brain_eval.py --synthetic-sanity --output experiments/_tmp_brain_eval.json
+python experiments/brain_eval.py --corpus your_numeric_corpus.jsonl --synthetic-sanity --output experiments/_tmp_brain_eval_real.json
+```
+
+资源基准和离线评估只向显式 `--output` 路径写入报告。非目标 `2c2g` 环境的资源门状态为
+`unverified`；数据量不足时，晋升状态为 `insufficient_data`。
+
 ---
 
 ## 计算层架构
@@ -165,60 +232,70 @@ Text → L1(HDC) → L2(Gate) → L3(Scar) → L4(Sheaf) → L5(HGT) → L6(Boun
 
 </details>
 
-### V2.0 — 共振场（当前稳定版）
+### V2.5 运行时架构
 
-基于物理启发的规则系统。7 模块同时注入信号到共振场，场执行单次确定性 mean-field 融合（非迭代收敛），表达作为跨 tick 的相变自发涌现。
+V2.5 对每个事件执行一次前向计算。七个模块生成状态向量，`DeterministicFusion` 执行一次
+mean-field 更新，随后生成 `Surface`。融合核不执行迭代收敛或吸引子搜索。
 
 ```mermaid
-flowchart TB
-    %% 输入层
-    INPUT["📥 文本 + 时间戳 + 上下文"]
+flowchart LR
+    INPUT["Event"] --> HDC["HDCEncoder"]
+    HDC --> GATE["PredictiveCodingGate"]
+    GATE --> STATE["VoidScarEngine"]
+    STATE --> SHEAF["ScarSheaf"]
+    SHEAF --> HGT["HeterogeneousGraphTransformer"]
+    HGT --> BOUNDARY["AutopoieticBoundary"]
+    BOUNDARY --> EXPRESSION["PhaseTransitionExpression"]
 
-    %% 7 模块并行感知
-    INPUT --> M0 & M1 & M2 & M3 & M4 & M5 & M6
+    HDC & GATE & STATE & SHEAF & HGT & BOUNDARY & EXPRESSION --> FUSION["DeterministicFusion"]
+    FUSION --> EMERGENCE["EmergenceTracker"]
+    EMERGENCE --> SURFACE["Surface"]
 
-    M0["HDC 感知<br/><small>超维编码</small>"]
-    M1["预测门控<br/><small>surprise 路由</small>"]
-    M2["虚空-伤痕<br/><small>创伤与缺失</small>"]
-    M3["关系层析<br/><small>sheaf 扩散</small>"]
-    M4["HGT 决策<br/><small>异构图融合</small>"]
-    M5["自创生边界<br/><small>身份维护</small>"]
-    M6["相变表达<br/><small>压力积累</small>"]
-
-    %% 全部注入共振场
-    M0 & M1 & M2 & M3 & M4 & M5 & M6 --> FIELD
-
-    subgraph FIELD["⚡ 共振场 — 单次确定性融合"]
-        direction LR
-        F1["42 通道<br/>耦合矩阵"]
-        F2["Hebbian 可塑性<br/>(PEL-Core, 默认关闭)"]
-        F4["Hopfield<br/>吸引子"]
-        F5["谐波<br/>身份核"]
-        F1 <--> F2 <--> F4 <--> F5
-    end
-
-    %% 输出
-    FIELD --> O1 & O2 & O3
-    O1["🎭 情感状态<br/><small>8 维连续向量</small>"]
-    O2["⚡ 表达决策<br/><small>express / hold / withdraw</small>"]
-    O3["🌀 涌现指标 Φ<br/><small>整合信息度</small>"]
-
-    %% 反馈回路
-    O1 -.->|"Hebbian 反馈"| F2
-    O2 -.->|"伤疤积累"| M2
+    ASSESSOR["assessment（可选）"] -.-> STATE
+    PEL["PELCore（可选）"] -.-> STATE
+    BRAIN["BrainComputeCore + Brain C（可选）"] -.-> STATE
+    STORE["BrainStateStore（SQLite）"] <--> BRAIN
 ```
 
-#### 核心机制
+#### 工程特性
 
-| 机制 | 理论来源 | 效果 | 状态 |
-|------|----------|------|------|
-| Hebbian 可塑性 + BCM 阈值 | Hebb 1949; Bienenstock-Cooper-Munro 1982 | 通道用进废退，自动发现重要连接 | PEL-Core 提供，默认关闭（opt-in） |
-| 自由能最小化 | Friston 2010 | 预测误差驱动注意力分配 | PEL-Core 提供（`‖e₀‖²` 下降），默认关闭 |
-| Hopfield 吸引子 | Hopfield 1982 | 情感记忆，表达 = 逃离吸引子 | 常驻 |
-| 谐波身份 | Hodge 1941 | 拓扑不变量 = 人格的数学实现 | 常驻 |
-| 耗散结构 | Prigogine 1977 | 能量有界，不会死循环 | 常驻 |
-| Sheaf Laplacian | Hansen et al. 2020 | 高阶拓扑一致性约束 | 常驻（V1 关系层析模块） |
-| HGT 自适应决策 | — | numpy 加速的异构图融合，在线 EMA 自适应 | 常驻 |
+V2.5 将计算、状态更新和权限控制拆分为可独立验证的边界：计算核采用单次前向，
+持久化采用提交后替换，Brain B/C 通过配置与晋升门控接入。
+
+| 机制 | 实现 | 工程作用 |
+|---|---|---|
+| 单次前向计算 | 七个模块生成状态向量，`DeterministicFusion` 执行一次 mean-field 更新 | 计算步数有界；同一输入与状态下的计算核输出可复现 |
+| 事务化状态更新 | 先生成候选状态，SQLite 提交成功后再替换内存状态 | 提交失败时保留并恢复最后一次已提交状态 |
+| 有限窗口幂等 | `event_id`、`feedback_id` 与持久化 receipt | 重试不重复推进状态；边界由 TTL 和 `dedup_horizon` 定义 |
+| Brain C 权限控制 | 默认关闭，`c_authority=0.0`，并受 promotion、warmup 与 residual cap 约束 | 可选路径不会在未授权时改变融合结果 |
+| 依赖边界 | 内置 Brain B/C 路径仅使用 Python 标准库与 SQLite | 不要求 PyTorch、CUDA 或独立进程 |
+
+#### 执行步骤
+
+| 步骤 | 组件 | 操作 |
+|---|---|---|
+| 1 | `HDCEncoder` | `text → HDC vector` |
+| 2 | `PredictiveCodingGate` | 计算 `surprise`；稀疏路由启用时选择 `fast / normal / full` |
+| 3 | `VoidScarEngine` | 更新 8 维状态、伤痕、空洞和关系参数 |
+| 4 | `ScarSheaf`、`HeterogeneousGraphTransformer`、`AutopoieticBoundary`、`PhaseTransitionExpression` | 生成模块状态向量；稀疏路由可跳过部分计算 |
+| 5 | `DeterministicFusion` | 对七个模块状态执行一次 `tanh + dissipation` mean-field 更新 |
+| 6 | `EmergenceTracker` | 生成运行时指标 |
+| 7 | `SylanneEngine` | 组装 `Surface`；按 `session_id` 隔离状态 |
+
+#### 状态更新路径
+
+| 路径 | 配置 | 状态写入 | 约束 |
+|---|---|---|---|
+| V2.5 基线 | 无额外配置 | 默认状态更新 | 默认启用 |
+| PEL-Core | `pel_core_enabled=True` | 预测编码状态、精度和 BCM 参数 | 默认关闭 |
+| Brain B | `brain_compute.enabled=True` | 8 维 B 主状态、事件 receipt、反馈 receipt | 默认关闭；仅支持 `mode="lite"` |
+| Brain C | `brain_compute.c_enabled=True` | C 状态、资格迹和 `target_tick` 反馈 | 默认关闭；`c_authority ∈ [0.0, 0.1]` |
+
+PEL-Core 与 Brain B/C 不能同时启用。Brain 路径先提交 SQLite，再替换内存状态；提交失败时丢弃
+候选状态并重新加载已提交状态。`event_id` 和 `feedback_id` 用于去重，`target_tick` 用于定位反馈目标。
+
+> [!NOTE]
+> V2.5 运行时不训练语义模型。可训练表示、反向传播和本地语义模型属于 V3 / SYLANN。
 
 #### 三档性能
 
@@ -358,7 +435,7 @@ Personality 是外在可观察的行为模式（effect）。Benvo 是产生这�
 
 一个月后，从同一 checkpoint 出发的两个实例将变成可辨识的不同感知者。
 
-技术规范：[`training/SYLANN_V3_SPEC.md`](training/SYLANN_V3_SPEC.md) | 论文草稿：[`training/PAPER_PREDICTION_ERROR.md`](training/PAPER_PREDICTION_ERROR.md)
+技术规范：[V3 student pipeline](docs/design/v3-student-pipeline-tdd.md)
 
 </details>
 
@@ -497,7 +574,7 @@ surface = await engine.submit("user_123", raw_text, msg_id=event.message_obj.mes
 | 同一 data_dir **显式传入**不同 config | 抛 `SharedEngineConflictError` |
 | 自读 `sylanne.config.json` 出现差异（文件被改/跨版本副本） | 仅警告并复用运行中的配置（重启生效），不崩后来者 |
 | 同一 data_dir 传入不同 `llm`/`embedding`/`assessor_llm` | 警告并复用原实例（可用 `set_llm()` 事后热替换） |
-| 直接 `SylanneEngine(...)` 构造但目标 data_dir 已有共享实例 | 软警告（不阻断，但你大概率在重复创建） |
+| 直接 `SylanneEngine(...)` 构造但目标 data_dir 已有共享实例 | 软警告（不阻断，通常表示重复创建） |
 
 **注意事项：**
 - 共享实例是 **event-loop 亲和**的——只在首次获取它的事件循环里使用，不要跨 loop/线程共享
@@ -512,7 +589,7 @@ SylanneEngine.is_shared("./data/x")  # True / False
 ```
 
 > [!TIP]
-> **插件开发者**：不要自己 `SylanneEngine(...)`，用 `SylanneEngine.shared(data_dir, llm)` + `submit()` 就行。约定一个统一的 data_dir，所有插件共享同一实例、同一去重表，零额外配置，也不用管自己是不是"第一个加载的"。
+> **插件开发者**：应使用 `SylanneEngine.shared(data_dir, llm)` + `submit()`，避免直接构造 `SylanneEngine(...)`。统一约定 data_dir 后，所有插件可共享同一实例与去重表，无需额外协调加载顺序。
 
 ---
 
@@ -583,7 +660,7 @@ SylannEngine/
 ├── experiments/                 # 12 项实验验证
 ├── training/                    # V3 SYLANN 训练代码与规范
 ├── tests/                       # 650+ 单元测试
-└── docs/                        # 论文 + 规范
+└── docs/                        # 规范与历史文档
 ```
 
 ---
@@ -594,21 +671,19 @@ SylannEngine/
 |------|------|
 | [SPEC.md](SPEC.md) | 标准规范（接口协议、输出 Schema） |
 | [AGENT_GUIDE.md](AGENT_GUIDE.md) | 开发者集成指南 |
-| [Paper (EN)](docs/resonance_field_paper_en.pdf) | 21 页，12 实验，完整数学推导 |
-| [Paper (中文)](docs/resonance_field_paper_zh.pdf) | 16 页中文版 |
 | [架构规范](docs/theoretical_spec.md) | 现行架构：计算模型、42 耦合通道、公理体系 |
 | [架构规范（历史）](docs/resonance_field_architecture.md) | 历史文档：2.5 前已移除的迭代共振场架构，仅作留档 |
-| [SYLANN V3 Spec](training/SYLANN_V3_SPEC.md) | V3 完整技术规范 |
-| [Prediction Error Paper](training/PAPER_PREDICTION_ERROR.md) | "预测误差即一切"论文草稿 |
+| [V3 student pipeline](docs/design/v3-student-pipeline-tdd.md) | V3 门控设计与验证路径 |
 
 ---
 
 ## 演化路线
 
 ```
-V2.0 共振场 (stable) ─────── 结构即计算，物理启发规则系统
-        │
-V2.1 EmotiCore (training) ── 102.7M teacher，Mamba+MoE，降低 LLM 依赖
+V2.0 共振场 (historical) ─── 早期迭代架构，已退出服务路径
+├── V2.1 EmotiCore (experimental) ── 102.7M teacher，独立实验路径
+└── V2.5 确定性融合 (stable) ─────── 现行架构
+    └── Brain B/C (opt-in) ───────── 状态持久化与定向反馈
         │
 V3.0 SYLANN (research) ───── 局部学习，无 backprop，情感从预测中涌现
         │
@@ -632,7 +707,8 @@ V3.0 SYLANN (research) ───── 局部学习，无 backprop，情感从�
 不会。每个 session_id 完全隔离。
 
 **Q: V3 能直接部署吗？**
-V3 目前是实验阶段。部署用 V2（零依赖 lite 档 ~5ms）或 V2.1（需要 GPU）。V3 的成果会通过蒸馏回馈到部署版本。
+V3 目前是实验阶段。部署使用 V2.5；Brain B/C 提供状态持久化与定向反馈，
+需要显式启用并通过离线评估门。V2.1 EmotiCore 作为需要 GPU 的独立实验路径保留。
 
 ---
 
@@ -640,10 +716,11 @@ V3 目前是实验阶段。部署用 V2（零依赖 lite 档 ~5ms）或 V2.1（�
 
 GNU Affero General Public License v3.0
 
-**本计算引擎开源免费，不希望被用于商业用途。** 如果你从中获益，希望你也能回馈社区。
+本项目由 2718Labs 维护，并按 AGPL-3.0-only 发布。使用、修改和分发时请遵守许可证条款；
+问题反馈与社区贡献可通过 GitHub Issues 和 Pull Requests 提交。
 
 ---
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=Ayleovelle/SylannEngine&type=Date)](https://star-history.com/#Ayleovelle/SylannEngine&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=2718labs/SylannEngine&type=Date)](https://star-history.com/#2718labs/SylannEngine&Date)

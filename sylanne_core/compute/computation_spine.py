@@ -22,11 +22,14 @@ import hashlib
 import logging
 import time
 from collections import deque
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, cast
 
+from .._numeric import _coerce_float
 from . import affect_projection
 from .autopoiesis import AutopoieticBoundary
 from .bounded_dict import BoundedDict
+from .brain_c import Route
+from .brain_errors import BrainDurabilityError, BrainOwnershipError
 from .hdc import HDCEncoder
 from .hgt import HeterogeneousGraphTransformer
 from .pad_interop import PADProjector, PADVector
@@ -44,7 +47,7 @@ from .phase_transition import PhaseTransitionExpression
 from .predictive_coding import PredictiveCodingGate
 from .relational_sheaf import ScarSheaf
 from .slow_channel import SlowChannel
-from .void_scar_engine import VoidScarEngine
+from .void_scar_engine import BrainSessionContext, VoidScarEngine, project_brain_assessment
 
 if TYPE_CHECKING:
     from ..config import DimensionProfile
@@ -240,6 +243,7 @@ class ComputationSpine:
         affect_slowchannel: bool = False,
         affect_plasticity: bool = False,
         affect_full_takeover: bool = False,
+        brain_context: BrainSessionContext | None = None,
     ):
         if profile is None:
             from ..config import build_profile
@@ -266,6 +270,7 @@ class ComputationSpine:
             scar_mlp_passes=profile.scar_mlp_passes,
             pel_enabled=pel_enabled,
             affect_enabled=affect_enabled,
+            brain_context=brain_context,
         )
         self.sheaf = ScarSheaf(n0=profile.stalk_dim)
         self.boundary = AutopoieticBoundary(
@@ -608,18 +613,19 @@ class ComputationSpine:
 
         # Intent-specific adjustments via scar base vector modulation (legacy path)
         if not took_over:
+            base = self.engine.scar_state.base
+            if not isinstance(base, list):
+                raise BrainOwnershipError("legacy assessment cannot write brain-owned base")
             if intent == "撒娇":
                 # Coquettish intent → soften base state (reduce tension dims)
-                if len(self.engine.scar_state.base) > 3:
-                    self.engine.scar_state.base[3] *= 0.85  # tension dim
-                if len(self.engine.scar_state.base) > 0:
-                    self.engine.scar_state.base[0] = min(
-                        1.0, self.engine.scar_state.base[0] + 0.1
-                    )  # warmth dim
+                if len(base) > 3:
+                    base[3] *= 0.85  # tension dim
+                if len(base) > 0:
+                    base[0] = min(1.0, base[0] + 0.1)  # warmth dim
             elif intent == "生气":
                 # Anger → raise tension in base state
-                if len(self.engine.scar_state.base) > 3:
-                    self.engine.scar_state.base[3] = min(1.0, self.engine.scar_state.base[3] + 0.2)
+                if len(base) > 3:
+                    base[3] = min(1.0, base[3] + 0.2)
 
         # Arousal modulates expression drive accumulation rate (both paths)
         if arousal > 0.7:
@@ -633,6 +639,8 @@ class ComputationSpine:
                 self.engine.scar_state.apply_affect_appraisal_shadow(
                     valence, arousal, wound_risk, intent
                 )
+            except (BrainDurabilityError, BrainOwnershipError):
+                raise
             except Exception:  # pragma: no cover - diagnostic path, must never crash a turn
                 logger.debug("affect-shadow appraisal (computation) skipped", exc_info=True)
 
@@ -641,6 +649,8 @@ class ComputationSpine:
             try:
                 a_k, _ = affect_projection.project_appraisal(valence, arousal, wound_risk, intent)
                 self._slow_channel.observe(a_k)
+            except (BrainDurabilityError, BrainOwnershipError):
+                raise
             except Exception:  # pragma: no cover - fail-closed
                 logger.debug("slow-channel observe (computation) skipped", exc_info=True)
 
@@ -687,6 +697,7 @@ class ComputationSpine:
         *,
         session_key: str = "",
         dialogue_quality: float | None = None,
+        event_id: str | None = None,
     ) -> dict[str, Any]:
         """主入口：处理一条消息通过完整的 7 层计算栈。
 
@@ -716,6 +727,9 @@ class ComputationSpine:
         # / AlphaKernel._tick_inner). Field-level None/NaN is handled by _coerce_float.
         if assessment is not None and not isinstance(assessment, dict):
             assessment = None
+        brain_enabled = self.engine.brain_enabled
+        sparse_routing = brain_enabled and self.engine.sparse_routing
+        is_blank = not text or not text.strip()
 
         # 结果缓存层（Item 20）：相同文本+相同评估短时间内直接返回缓存
         # assessment 不同意味着 LLM 给出了新评估，必须重新计算
@@ -725,7 +739,7 @@ class ComputationSpine:
             else ""
         )
         cache_key = (text, session_key or "", assess_sig, dialogue_quality)
-        cached = self._result_cache.get(cache_key)
+        cached = None if brain_enabled else self._result_cache.get(cache_key)
         if cached is not None:
             return copy.deepcopy(cached)
 
@@ -743,11 +757,15 @@ class ComputationSpine:
         if dialogue_quality is not None:
             try:
                 self.engine.scar_state.apply_affect_quality(float(dialogue_quality))
+            except (BrainDurabilityError, BrainOwnershipError):
+                raise
             except Exception:  # pragma: no cover - learning must never crash a turn
                 logger.debug("affect plasticity hook (computation) skipped", exc_info=True)
 
         # Empty string handling: skip computation, self-repair only
-        if not text or not text.strip():
+        if is_blank:
+            if brain_enabled:
+                self.engine.commit_neutral_brain_event(event_id)
             self.boundary.self_repair()
             self.expression.silence_lowers_threshold(dt=1.0)
             result = self._build_result(
@@ -780,11 +798,16 @@ class ComputationSpine:
                 try:
                     h = self.encoder.encode_text(text)
                     cb.record_success(h)
+                except (BrainDurabilityError, BrainOwnershipError):
+                    raise
                 except Exception as exc:
                     cb.record_failure()
                     h = cb.fallback() or bytearray(self.encoder.dim // 8)
                     logger.error("Layer perception failed: %s — using fallback", exc)
         self._last_hdc_vec = h
+        if brain_enabled and is_blank:
+            h = bytearray(self.encoder.dim // 8)
+            self._last_hdc_vec = h
         _elapsed = time.perf_counter_ns() - t0
         self._timings["perception"].append(_elapsed)
         if _elapsed > _LAYER_TIMEOUT_NS:
@@ -807,14 +830,20 @@ class ComputationSpine:
                 logger.warning("Layer gate circuit OPEN — using fallback")
             else:
                 try:
-                    surprise = self.gate.surprise(h)
+                    surprise = 0.0 if brain_enabled and is_blank else self.gate.surprise(h)
                     if self._diagnostics_enabled:
                         l1_payload = self._l1_hdc_payload(text, h, surprise)
                     else:
                         l1_payload = dict(_L1_PAYLOAD_FALLBACK)
-                    route = self.gate.route(surprise)
-                    self.gate.update(h, surprise)
+                    if sparse_routing:
+                        route = self.gate.route(surprise)
+                        self.gate.update_stable(h, surprise, cast(str, event_id))
+                    else:
+                        route = "normal" if brain_enabled else self.gate.route(surprise)
+                        self.gate.update(h, surprise)
                     cb.record_success({"surprise": surprise, "route": route})
+                except (BrainDurabilityError, BrainOwnershipError):
+                    raise
                 except Exception as exc:
                     cb.record_failure()
                     _gate_fallback = cb.fallback() or {"surprise": 0.0, "route": "fast"}
@@ -822,6 +851,10 @@ class ComputationSpine:
                     route = _gate_fallback["route"]
                     l1_payload = dict(_L1_PAYLOAD_FALLBACK)
                     logger.error("Layer gate failed: %s — using fallback", exc)
+        if brain_enabled and not sparse_routing:
+            route = "normal"
+            if is_blank:
+                surprise = 0.0
         self._last_route = route
         if route in self._route_counts:
             self._route_counts[route] += 1
@@ -832,8 +865,15 @@ class ComputationSpine:
 
         # Layer 3+4: Void-Scar Engine (replaces SSM + TopologicalMemory)
         t0 = time.perf_counter_ns()
+        projected_assessment: list[float] | None = None
+        assessment_wound: list[float] | None = None
+        if brain_enabled:
+            projected_assessment, assessment_wound = project_brain_assessment(assessment)
+
         if not self._layer_enabled.get("void_scar", True):
             ssm_input = [0.0] * 8
+            if brain_enabled:
+                self.engine.commit_neutral_brain_event(event_id)
             emotion = self.engine.observe()
             recalled = []
             holes = []
@@ -843,18 +883,37 @@ class ComputationSpine:
             if cb.is_open():
                 _vs_fallback = cb.fallback() or {}
                 ssm_input = [0.0] * 8
+                if brain_enabled:
+                    self.engine.commit_neutral_brain_event(event_id)
                 emotion = _vs_fallback.get("emotion", self.engine.observe())
                 recalled = _vs_fallback.get("recalled", [])
                 holes = _vs_fallback.get("holes", [])
                 logger.warning("Layer void_scar circuit OPEN — using fallback")
             else:
                 try:
-                    ssm_input = self._hdc_to_ssm_input(h, surprise)
+                    ssm_input = (
+                        [0.0] * self.engine.scar_state.n_dims
+                        if brain_enabled and is_blank
+                        else self._hdc_to_ssm_input(h, surprise)
+                    )
                     self.engine.process(
                         event_vec=bytes(h),
                         ssm_input=ssm_input,
                         surprise=surprise,
                         timestamp=timestamp,
+                        event_id=event_id,
+                        projected_assessment=projected_assessment,
+                        assessment_wound=assessment_wound,
+                        route=cast(Route, route),
+                        perception_acuity=_coerce_float(
+                            self._personality.get(
+                                "perception_acuity",
+                                self._personality.get("neuroticism", 0.5),
+                            ),
+                            0.0,
+                            1.0,
+                            0.5,
+                        ),
                     )
                     emotion = self.engine.observe()
                     recalled = [
@@ -870,8 +929,12 @@ class ComputationSpine:
                         for v in self.engine.void_space.voids
                     ]
                     cb.record_success({"emotion": emotion, "recalled": recalled, "holes": holes})
+                except (BrainDurabilityError, BrainOwnershipError):
+                    raise
                 except Exception as exc:
                     cb.record_failure()
+                    if brain_enabled:
+                        self.engine.commit_neutral_brain_event(event_id)
                     _vs_fallback = cb.fallback() or {}
                     ssm_input = [0.0] * 8
                     emotion = _vs_fallback.get("emotion", self.engine.observe())
@@ -885,7 +948,7 @@ class ComputationSpine:
 
         # Layer 3.5: LLM Assessment modulation (if available this tick)
         assessment_source = "hdc_only"
-        if assessment:  # already normalized to dict-or-None at process() entry
+        if assessment and not brain_enabled:  # already normalized to dict-or-None at entry
             self.apply_assessment(assessment)
             assessment_source = "llm_assessed"
             # Re-observe after assessment modulation
@@ -894,8 +957,12 @@ class ComputationSpine:
 
         # Layer 4: Relational Sheaf — cross-relational propagation
         t0 = time.perf_counter_ns()
-        if not self._layer_enabled.get("sheaf", True):
-            sheaf_result: dict[str, Any] = {}
+        skip_sparse_optional = sparse_routing and route != "full"
+        sheaf_result: dict[str, Any]
+        if skip_sparse_optional:
+            sheaf_result = {}
+        elif not self._layer_enabled.get("sheaf", True):
+            sheaf_result = {}
             logger.debug("Layer sheaf DISABLED — using defaults")
         else:
             cb = self._circuit_breakers["sheaf"]
@@ -906,6 +973,8 @@ class ComputationSpine:
                 try:
                     sheaf_result = self.sheaf.tick(0, ssm_input, timestamp=timestamp)
                     cb.record_success(sheaf_result)
+                except (BrainDurabilityError, BrainOwnershipError):
+                    raise
                 except Exception as exc:
                     cb.record_failure()
                     sheaf_result = cb.fallback() or {}
@@ -918,7 +987,9 @@ class ComputationSpine:
 
         # Layer 5: Heterogeneous Graph Transformer — decision fusion
         t0 = time.perf_counter_ns()
-        if not self._layer_enabled.get("hgt", True):
+        if skip_sparse_optional:
+            hgt_decision = [0.0, 0.0, 0.0, 0.0]
+        elif not self._layer_enabled.get("hgt", True):
             hgt_decision = [0.0, 0.0, 0.0, 0.0]
             logger.debug("Layer hgt DISABLED — using defaults")
         else:
@@ -942,6 +1013,8 @@ class ComputationSpine:
                     )
                     hgt_decision = self.hgt.forward(hgt_tokens, self._personality)
                     cb.record_success(hgt_decision)
+                except (BrainDurabilityError, BrainOwnershipError):
+                    raise
                 except Exception as exc:
                     cb.record_failure()
                     hgt_decision = cb.fallback() or [0.0, 0.0, 0.0, 0.0]
@@ -999,7 +1072,7 @@ class ComputationSpine:
                 },
                 "L3_VoidScar": l3_payload,
                 "L4_Sheaf": l4_payload,
-                "L5_HGT": self._l5_payload(hgt_decision),
+                "L5_HGT": self._l5_payload(hgt_decision, executed=not skip_sparse_optional),
                 "L6_Boundary": self.boundary.to_dict(),
                 "L7_Expression": result["expression_state"],
             }
@@ -1007,7 +1080,8 @@ class ComputationSpine:
                 result["dialogue_quality"] = dialogue_quality
                 result["_consume_dialogue_quality"] = True  # one-shot bypass of drift rate-limit
             self._drift_embodiment(result)
-            self._result_cache[cache_key] = result
+            if not brain_enabled:
+                self._result_cache[cache_key] = result
             return result
 
         # Normal/Full path: boundary + expression
@@ -1098,7 +1172,7 @@ class ComputationSpine:
             },
             "L3_VoidScar": l3_payload,
             "L4_Sheaf": l4_payload,
-            "L5_HGT": self._l5_payload(hgt_decision),
+            "L5_HGT": self._l5_payload(hgt_decision, executed=not skip_sparse_optional),
             "L6_Boundary": self.boundary.to_dict(),
             "L7_Expression": self.expression.state(),
         }
@@ -1106,7 +1180,8 @@ class ComputationSpine:
             result["dialogue_quality"] = dialogue_quality
             result["_consume_dialogue_quality"] = True  # one-shot bypass of drift rate-limit
         self._drift_embodiment(result)
-        self._result_cache[cache_key] = result
+        if not brain_enabled:
+            self._result_cache[cache_key] = result
         return result
 
     def _drift_embodiment(self, result: dict[str, Any]) -> None:
@@ -1171,7 +1246,23 @@ class ComputationSpine:
                 updated[emb_name] = tm.value
             self.apply_personality(updated)
 
-    def _l5_payload(self, hgt_decision: list[float]) -> dict[str, Any]:
+    def _l5_payload(
+        self,
+        hgt_decision: list[float],
+        *,
+        executed: bool = True,
+    ) -> dict[str, Any]:
+        if not executed:
+            return {
+                "attention": [],
+                "experts": {"active": [], "gates": [], "names": []},
+                "decision": list(hgt_decision),
+                "adaptation": {
+                    "router_bias": [],
+                    "attention_drift": [],
+                    "plasticity": 0.0,
+                },
+            }
         attn = self.hgt._last_attention_weights
         experts = self.hgt._last_active_experts
         gates = self.hgt._last_gate_values
@@ -1350,10 +1441,8 @@ class ComputationSpine:
         if "engine" in data:
             # Rebuild engine from persisted scar/void state
             engine_data = data["engine"]
-            from .scar_algebra import ScarredState
-
             if "scar" in engine_data:
-                self.engine.scar_state = ScarredState.from_dict(
+                self.engine.restore_scar_state(
                     engine_data["scar"],
                     pel_enabled=self._pel_enabled,
                     affect_enabled=self._affect_enabled,

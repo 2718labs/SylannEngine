@@ -228,3 +228,9 @@ sylanne_core/_identity.json
 # (Trained model .npz go through the models/ Git-LFS registry, not here — see TDD §7.)
 training/student_core/*.parquet
 training/**/*.parquet
+
+# Internal session/planning artifacts — Codex/Claude working notes, not product docs.
+/progress.md
+/findings.md
+/task_plan.md
+/docs/superpowers/

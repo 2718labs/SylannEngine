@@ -11,8 +11,38 @@
 
 from __future__ import annotations
 
+import hashlib
+import math
 import random
+from collections.abc import Iterator
 from typing import Any
+
+
+def _stable_choices(event_id: str, stream_tag: bytes) -> Iterator[float]:
+    """Yield a process-independent pseudorandom stream for one canonical event."""
+    if not isinstance(event_id, str):
+        raise TypeError("event_id must be a string")
+    try:
+        event_bytes = event_id.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError("event_id must be valid UTF-8 text") from error
+    seed = hashlib.blake2b(
+        b"sylanne-predictive-gate-v1\x00"
+        + stream_tag
+        + len(event_bytes).to_bytes(8, "big")
+        + event_bytes,
+        digest_size=32,
+    ).digest()
+    counter = 0
+    while True:
+        block = hashlib.blake2b(
+            seed + counter.to_bytes(8, "big"),
+            digest_size=64,
+            person=b"SylGateChoiceV1",
+        ).digest()
+        counter += 1
+        for offset in range(0, len(block), 2):
+            yield int.from_bytes(block[offset : offset + 2], "big") / 65536.0
 
 
 class PredictiveCodingGate:
@@ -42,6 +72,7 @@ class PredictiveCodingGate:
         "_fast_threshold",
         "_full_threshold",
         "_rng",
+        "_stable_updates",
     )
 
     def __init__(self, dim: int = 1024, decay: float = 0.92):
@@ -60,6 +91,7 @@ class PredictiveCodingGate:
         self._fast_threshold = 0.15  # 低于此值走 fast path
         self._full_threshold = 0.45  # 高于此值走 full path
         self._rng: random.Random = random.Random(42)  # 确定性随机源
+        self._stable_updates = False
 
     def surprise(self, input_vec: bytearray | list[int]) -> float:
         """计算惊讶度：预测向量与实际输入之间的 Hamming 距离。
@@ -125,6 +157,47 @@ class PredictiveCodingGate:
                     for bit in range(8):
                         if (self._prediction[i] & (1 << bit)) and self._rng.random() < lr * 0.1:
                             self._prediction[i] &= ~(1 << bit)
+        self._finish_update(surprise_value)
+
+    def update_stable(
+        self,
+        input_vec: bytearray | list[int],
+        surprise_value: float,
+        event_id: str,
+    ) -> None:
+        """Update using event-derived BLAKE2b choices instead of live RNG state."""
+        lr = min(0.3, max(0.01, surprise_value * 0.5))
+        if isinstance(input_vec, bytearray):
+            choices = _stable_choices(event_id, b"byte-vector")
+            for i in range(min(len(input_vec), self._byte_dim)):
+                diff = self._prediction[i] ^ input_vec[i]
+                mask = 0
+                for bit in range(8):
+                    choice = next(choices)
+                    if (diff >> bit) & 1 and choice < lr:
+                        mask |= 1 << bit
+                self._prediction[i] ^= mask
+        else:
+            choices = _stable_choices(event_id, b"density-vector")
+            density = sum(input_vec) / max(1, len(input_vec))
+            target_ones = int(density * self.dim)
+            current_ones = sum(b.bit_count() for b in self._prediction)
+            if current_ones < target_ones:
+                for i in range(self._byte_dim):
+                    for bit in range(8):
+                        choice = next(choices)
+                        if not (self._prediction[i] & (1 << bit)) and choice < lr * 0.1:
+                            self._prediction[i] |= 1 << bit
+            elif current_ones > target_ones:
+                for i in range(self._byte_dim):
+                    for bit in range(8):
+                        choice = next(choices)
+                        if (self._prediction[i] & (1 << bit)) and choice < lr * 0.1:
+                            self._prediction[i] &= ~(1 << bit)
+        self._stable_updates = True
+        self._finish_update(surprise_value)
+
+    def _finish_update(self, surprise_value: float) -> None:
         # 更新精度：指数移动平均，低惊讶 → 精度上升（预测越来越准）
         self.precision = self.decay * self.precision + (1 - self.decay) * (1.0 - surprise_value)
         # clamp 精度到 [0.1, 1.0]，防止精度归零导致系统失灵
@@ -169,7 +242,7 @@ class PredictiveCodingGate:
         """序列化为字典，用于持久化存储。"""
         import base64
 
-        return {
+        snapshot = {
             "decay": self.decay,
             "precision": self.precision,
             "prediction": base64.b64encode(bytes(self._prediction)).decode("ascii"),
@@ -177,13 +250,39 @@ class PredictiveCodingGate:
             "mean_surprise": self.mean_surprise(),
             "history_len": len(self._surprise_history),
         }
+        if self._stable_updates:
+            snapshot["fast_threshold"] = self._fast_threshold
+            snapshot["full_threshold"] = self._full_threshold
+        return snapshot
 
     def from_dict(self, data: dict[str, Any]) -> None:
         """从持久化状态恢复。"""
         import base64
 
+        has_fast_threshold = "fast_threshold" in data
+        has_full_threshold = "full_threshold" in data
+        if has_fast_threshold != has_full_threshold:
+            raise ValueError("stable route thresholds must be a complete pair")
+        restored_thresholds: tuple[float, float] | None = None
+        if has_fast_threshold:
+            try:
+                fast_threshold = float(data["fast_threshold"])
+                full_threshold = float(data["full_threshold"])
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError("stable route thresholds must be finite numbers") from error
+            if not (
+                math.isfinite(fast_threshold)
+                and math.isfinite(full_threshold)
+                and 0.0 <= fast_threshold <= full_threshold <= 1.0
+            ):
+                raise ValueError("stable route thresholds must satisfy 0 <= fast <= full <= 1")
+            restored_thresholds = (fast_threshold, full_threshold)
+
         self.decay = float(data.get("decay", self.decay))
         self.precision = float(data.get("precision", 0.5))
+        if restored_thresholds is not None:
+            self._fast_threshold, self._full_threshold = restored_thresholds
+            self._stable_updates = True
         # Support new format (full prediction vector)
         if "prediction" in data:
             self._prediction = bytearray(base64.b64decode(data["prediction"]))

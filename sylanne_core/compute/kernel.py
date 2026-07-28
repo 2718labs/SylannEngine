@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 from . import affect_dynamics, affect_output_contract
 from .attention import focus_information_flood
 from .body import SCHEMA_VERSION, AlphaBodyState
+from .brain_errors import BrainDurabilityError, BrainOwnershipError
 from .computation_spine import ComputationSpine
 from .hot_pool import HotPool
 from .importer import import_legacy_body
@@ -88,6 +89,7 @@ class AlphaKernelEvent:
     包含 kernel tick 所需的全部输入信息。
     """
 
+    event_id: str | None = None
     text: str = ""
     values: dict[str, float] = field(default_factory=dict)
     confidence: float = 0.0
@@ -153,6 +155,7 @@ class AlphaKernel:
         affect_slowchannel: bool = False,
         affect_plasticity: bool = False,
         affect_full_takeover: bool = False,
+        brain_context: Any | None = None,
     ) -> AlphaKernel:
         """从零创建或从旧版数据迁移创建 kernel。"""
         if legacy is None:
@@ -160,7 +163,7 @@ class AlphaKernel:
         else:
             body, audit, turns = import_legacy_body(legacy)
             kernel = cls(session_key=session_key, body=body, audit=audit, turns=turns)
-        if profile is not None:
+        if profile is not None or brain_context is not None:
             kernel.computation = _DEFAULT_SPINE(
                 profile=profile,
                 pel_enabled=pel_enabled,
@@ -169,8 +172,10 @@ class AlphaKernel:
                 affect_slowchannel=affect_slowchannel,
                 affect_plasticity=affect_plasticity,
                 affect_full_takeover=affect_full_takeover,
+                brain_context=brain_context,
             )
-            kernel.hot_pool = HotPool(n_dims=profile.emotion_dim, mode=profile.mode)
+            if profile is not None:
+                kernel.hot_pool = HotPool(n_dims=profile.emotion_dim, mode=profile.mode)
         return kernel
 
     @classmethod
@@ -185,6 +190,7 @@ class AlphaKernel:
         affect_slowchannel: bool = False,
         affect_plasticity: bool = False,
         affect_full_takeover: bool = False,
+        brain_context: Any | None = None,
     ) -> AlphaKernel:
         """从持久化快照恢复 kernel，对每个字段做类型安全的反序列化。"""
         kernel = cls(
@@ -201,7 +207,7 @@ class AlphaKernel:
             moral_repair=_as_dict(snapshot.get("moral_repair")),
             fallibility=_as_dict(snapshot.get("fallibility")),
         )
-        if profile is not None:
+        if profile is not None or brain_context is not None:
             kernel.computation = _DEFAULT_SPINE(
                 profile=profile,
                 pel_enabled=pel_enabled,
@@ -210,8 +216,10 @@ class AlphaKernel:
                 affect_slowchannel=affect_slowchannel,
                 affect_plasticity=affect_plasticity,
                 affect_full_takeover=affect_full_takeover,
+                brain_context=brain_context,
             )
-            kernel.hot_pool = HotPool(n_dims=profile.emotion_dim, mode=profile.mode)
+            if profile is not None:
+                kernel.hot_pool = HotPool(n_dims=profile.emotion_dim, mode=profile.mode)
         if "computation" in snapshot and isinstance(snapshot["computation"], dict):
             kernel.computation.from_dict(snapshot["computation"])
         if "hot_pool" in snapshot and isinstance(snapshot["hot_pool"], dict):
@@ -255,6 +263,8 @@ class AlphaKernel:
         event = self._event(event)
         try:
             return self._tick_inner(event, assessment)
+        except (BrainDurabilityError, BrainOwnershipError):
+            raise
         except Exception:
             logger.warning("tick failed, returning fallback", exc_info=True)
             return {
@@ -307,6 +317,7 @@ class AlphaKernel:
             event.now,
             assessment=assessment,
             dialogue_quality=_dq,
+            event_id=event.event_id,
         )
         # Emotional debt is updated from this tick's read before _decide reads the
         # reach_out threshold — a bruising exchange brings her back sooner than flat
@@ -380,7 +391,7 @@ class AlphaKernel:
 
     def snapshot(self) -> dict[str, Any]:
         """导出可持久化的完整内部状态（供 AlphaRuntime 序列化到磁盘）。"""
-        return {
+        snapshot = {
             "schema_version": SCHEMA_VERSION,
             "session_key": self.session_key,
             "turns": self.turns,
@@ -399,6 +410,10 @@ class AlphaKernel:
             "_last_computation_result": self._last_computation_result,
             "_affect_debt": self._affect_debt,
         }
+        brain_reference = self.computation.engine.brain_reference
+        if brain_reference is not None:
+            snapshot["brain_compute"] = brain_reference
+        return snapshot
 
     def _diagnostics(
         self,
@@ -1220,6 +1235,9 @@ class AlphaKernel:
         if not math.isfinite(now):
             now = 0.0
         return AlphaKernelEvent(
+            event_id=(
+                str(payload.get("event_id")) if payload.get("event_id") is not None else None
+            ),
             text=str(payload.get("text") or ""),
             values=dict(payload.get("values") or {}),
             confidence=confidence,

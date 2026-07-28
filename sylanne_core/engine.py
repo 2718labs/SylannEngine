@@ -17,24 +17,231 @@ Typical usage::
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
+import inspect
 import logging
+import math
+import re
+import struct
 import time
-from collections import OrderedDict
+import unicodedata
+import uuid
+from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from .compute import SylanneHost
+    from .compute.brain_store import BrainStateStore, StoredReceipt
     from .telemetry import DistillationSink
 
 from .compute.utils import safe_filename
 from .config import SylanneConfig
-from .types import EngineStatus, HealthStatus, Surface
+from .types import EngineStatus, FeedbackReceipt, HealthStatus, Surface
 
 logger = logging.getLogger("sylanne_core")
+
+_IDENTIFIER_MAX_BYTES = 256
+_NOTIFICATION_CAPACITY = 64
+_LISTENER_TIMEOUT_SECONDS = 30.0
+_FEEDBACK_SOURCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}\Z")
+_FEEDBACK_STATUSES = {
+    "applied",
+    "duplicate",
+    "missed",
+    "no_effect",
+    "disabled",
+    "degraded",
+}
+
+
+def _validated_identifier(value: object, *, name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} must be a nonempty string")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError(f"{name} must be valid UTF-8 text") from error
+    if len(encoded) > _IDENTIFIER_MAX_BYTES:
+        raise ValueError(f"{name} UTF-8 encoding must be at most 256 bytes")
+    if any(unicodedata.category(character) in {"Cc", "Cf", "Cs"} for character in value):
+        raise ValueError(f"{name} must not contain Unicode control characters")
+    return value
+
+
+def _finite_feedback_number(value: object, *, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite number")
+    try:
+        converted = float(cast(Any, value))
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"{name} must be a finite number") from error
+    if not math.isfinite(converted):
+        raise ValueError(f"{name} must be a finite number")
+    return converted
+
+
+def _generated_feedback_id(
+    *, source: str, target_tick: int, value: float, confidence: float
+) -> str:
+    source_bytes = source.encode("utf-8")
+    canonical_value = 0.0 if value == 0.0 else value
+    canonical_confidence = 0.0 if confidence == 0.0 else confidence
+    identity = (
+        struct.pack(">I", len(source_bytes))
+        + source_bytes
+        + struct.pack(">Qdd", target_tick, canonical_value, canonical_confidence)
+    )
+    return hashlib.sha256(identity).hexdigest()
+
+
+class _NotificationSlots:
+    """Loop-affine reservation counter with a genuine nonblocking listener path."""
+
+    __slots__ = ("_accepting", "_available", "_capacity", "_waiters")
+
+    def __init__(self, capacity: int) -> None:
+        self._capacity = capacity
+        self._available = capacity
+        self._accepting = True
+        self._waiters: deque[asyncio.Future[None]] = deque()
+
+    async def acquire(self, *, nonblocking: bool) -> None:
+        from .compute.brain_errors import BrainNotificationBackpressureError
+
+        if not self._accepting:
+            raise BrainNotificationBackpressureError("notification admission is closed")
+        if self._available:
+            self._available -= 1
+            return
+        if nonblocking:
+            raise BrainNotificationBackpressureError(
+                "listener-context notification capacity is full"
+            )
+        waiter = asyncio.get_running_loop().create_future()
+        self._waiters.append(waiter)
+        try:
+            await waiter
+        except BaseException:
+            if not waiter.done():
+                waiter.cancel()
+            try:
+                self._waiters.remove(waiter)
+            except ValueError:
+                pass
+            raise
+
+    def release(self) -> None:
+        while self._waiters:
+            waiter = self._waiters.popleft()
+            if not waiter.done():
+                waiter.set_result(None)
+                return
+        self._available = min(self._capacity, self._available + 1)
+
+    def close(self, error: BaseException) -> None:
+        self._accepting = False
+        while self._waiters:
+            waiter = self._waiters.popleft()
+            if not waiter.done():
+                waiter.set_exception(error)
+
+
+@dataclass(slots=True)
+class _NotificationRecord:
+    session_id: str
+    generation: int
+    tick_id: int
+    mutation_seq: int
+    surface: Surface
+    listeners: tuple[Callable[[str, Surface], Any], ...]
+    completion: asyncio.Future[None]
+    stop_after_current_callback: bool = False
+    released: bool = False
+
+
+@dataclass(slots=True)
+class _NotificationState:
+    slots: _NotificationSlots = field(
+        default_factory=lambda: _NotificationSlots(_NOTIFICATION_CAPACITY)
+    )
+    queue: deque[_NotificationRecord] = field(default_factory=deque)
+    worker: asyncio.Task[None] | None = None
+    current: _NotificationRecord | None = None
+    blocked_through_generation: int = -1
+
+
+@dataclass(frozen=True, slots=True)
+class _ProcessResult:
+    surface: Surface
+    delivery: asyncio.Future[None] | None
+
+
+_LISTENER_RECORD: contextvars.ContextVar[_NotificationRecord | None] = contextvars.ContextVar(
+    "sylanne_listener_record",
+    default=None,
+)
+
+
+@dataclass(slots=True)
+class _SessionEntry:
+    session_id: str
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    host: SylanneHost | None = None
+    epoch: int = 0
+    references: int = 0
+    waiters: int = 0
+    owners: int = 0
+    eviction_reserved: bool = False
+
+
+class _SessionLease:
+    __slots__ = ("_engine", "_entry", "_session_id")
+
+    def __init__(self, engine: SylanneEngine, session_id: str) -> None:
+        self._engine = engine
+        self._session_id = session_id
+        self._entry: _SessionEntry | None = None
+
+    async def __aenter__(self) -> _SessionEntry:
+        entry = await self._engine._retain_session_entry(self._session_id)
+        self._entry = entry
+        try:
+            await entry.lock.acquire()
+        except BaseException:
+            await self._engine._release_session_waiter(entry)
+            self._entry = None
+            raise
+        await self._engine._promote_session_owner(entry)
+        return entry
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        entry = self._entry
+        if entry is None:
+            return
+        if exc_type is not None:
+            from .compute.brain_errors import BrainDurabilityError, BrainOwnershipError
+
+            if issubclass(exc_type, (BrainDurabilityError, BrainOwnershipError)):
+                try:
+                    await self._engine._detach_entry_host(entry, flush=False)
+                except BaseException:
+                    logger.warning(
+                        "failed to close strict-failure Host for session %r",
+                        entry.session_id,
+                        exc_info=True,
+                    )
+        entry.lock.release()
+        await self._engine._release_session_owner(entry)
+        self._entry = None
 
 
 @dataclass
@@ -119,13 +326,30 @@ class SylanneEngine:
                 from ._assessor_llm import build_from_config
 
                 assessor_llm = build_from_config(assessor_block)
+        from .compute.brain_backend import get_brain_backend_factory
+
+        try:
+            get_brain_backend_factory(config.brain_compute.c_backend)
+        except KeyError:
+            raise ValueError(f"unknown brain backend {config.brain_compute.c_backend!r}") from None
         self._config = config
         self._assessor_llm = assessor_llm
         self._shared = _shared
         self._status: EngineStatus = "init"
-        self._hosts: dict[str, SylanneHost] = {}
+        self._hosts: OrderedDict[str, SylanneHost] = OrderedDict()
         self._locks: dict[str, asyncio.Lock] = {}
+        self._session_entries: OrderedDict[str, _SessionEntry] = OrderedDict()
+        self._host_map_lock = asyncio.Lock()
+        self._host_condition = asyncio.Condition(self._host_map_lock)
+        self._host_build_reservations = 0
+        self._host_trim_task: asyncio.Task[None] | None = None
+        self._brain_store: BrainStateStore | None = None
+        self._brain_inflight: dict[tuple[bytes, bytes], asyncio.Task[_ProcessResult]] = {}
         self._listeners: list[Callable[[str, Surface], Any]] = []
+        self._listener_tasks: set[asyncio.Future[Any]] = set()
+        self._notifications: dict[str, _NotificationState] = {}
+        self._notification_pending: set[asyncio.Future[None]] = set()
+        self._notifications_accepting = True
         self._telemetry_sink: DistillationSink | None = self._build_telemetry_sink()
         # --- submit() dedup table (engine-instance, engine-loop-affine: no locks) ---
         self._submissions: dict[Any, _Submission] = {}
@@ -150,11 +374,28 @@ class SylanneEngine:
 
     async def start(self) -> None:
         """Initialize the engine. Must be called before process/tick."""
+        if self._status == "running":
+            return
+        if self._status == "closed":
+            self._host_map_lock = asyncio.Lock()
+            self._host_condition = asyncio.Condition(self._host_map_lock)
+            self._host_build_reservations = 0
+            self._host_trim_task = None
+        self._notifications_accepting = True
         self._data_dir.mkdir(parents=True, exist_ok=True)
         if self._config_from_file:
             from ._config_store import write_default_config
 
             write_default_config(self._data_dir)
+        if self._config.brain_compute.enabled:
+            from .compute.brain_store import BrainStateStore
+
+            self._brain_store = await asyncio.to_thread(
+                BrainStateStore.start,
+                self._data_dir,
+                dedup_horizon=self._config.brain_compute.dedup_horizon,
+                feedback_horizon=self._config.brain_compute.feedback_horizon,
+            )
         self._status = "running"
 
     async def _ensure_started(self) -> None:
@@ -196,9 +437,19 @@ class SylanneEngine:
     async def shutdown(self) -> None:
         """Flush all sessions and release resources. Engine becomes 'closed'."""
         had_flush_error = False
-        for session_id, host in self._hosts.items():
+        try:
+            await self._shutdown_notifications()
+        except Exception:
+            had_flush_error = True
+            logger.warning("notification shutdown failed", exc_info=True)
+        trim_task = self._host_trim_task
+        self._host_trim_task = None
+        if trim_task is not None and not trim_task.done():
+            trim_task.cancel()
+            await asyncio.gather(trim_task, return_exceptions=True)
+        for session_id, host in tuple(self._hosts.items()):
             try:
-                host.flush()
+                await asyncio.to_thread(host.close, flush=True)
             except Exception:
                 had_flush_error = True
                 logger.warning(
@@ -208,8 +459,19 @@ class SylanneEngine:
                 )
         self._hosts.clear()
         self._locks.clear()
+        self._session_entries.clear()
+        self._host_build_reservations = 0
         self._cancel_and_clear_submissions()
+        self._brain_inflight.clear()
         self._last_tick.clear()
+        store = self._brain_store
+        self._brain_store = None
+        if store is not None:
+            try:
+                await asyncio.to_thread(store.close)
+            except Exception:
+                had_flush_error = True
+                logger.warning("brain store close failed during shutdown", exc_info=True)
         if self._telemetry_sink is not None:
             self._telemetry_sink.close()
         # Preserve a flush failure in the final status instead of masking it as a
@@ -232,6 +494,7 @@ class SylanneEngine:
         flags: list[str] | None = None,
         now: float | None = None,
         values: dict[str, float] | None = None,
+        event_id: str | None = None,
     ) -> Surface:
         """Process a user message and return the computed emotional surface.
 
@@ -245,6 +508,8 @@ class SylanneEngine:
                 特殊键 ``"dialogue_quality"``（归一化 [0,1]）= 对上一轮回复的质量自评，
                 驱动「越聊越校准」人格漂移：高分强化表达欲+拉近关系，低分收敛表达欲。
                 滞后反馈——在评分对象的下一轮调用时传入。
+            event_id: Stable platform event identity. Brain mode generates a UUID
+                when omitted; generated IDs do not provide retry idempotency.
 
         Returns:
             Surface dict with keys: state, decision, guard, personality, memory, dynamics.
@@ -265,24 +530,302 @@ class SylanneEngine:
                 self._data_dir,
             )
         await self._ensure_started()
+        if self._config.brain_compute.enabled:
+            canonical_event_id = (
+                str(uuid.uuid4())
+                if event_id is None
+                else _validated_identifier(event_id, name="event_id")
+            )
+            return await self._process_brain_event(
+                session_id,
+                text,
+                event_id=canonical_event_id,
+                confidence=confidence,
+                flags=flags,
+                now=now,
+                values=values,
+            )
         assessment = await self._assess(text) if self._config.assessor_enabled else None
+        notification = await self._reserve_notification(session_id)
+        enqueued = False
+        try:
+            async with self._session_lock(session_id):
+                host = await self._get_or_create_host(session_id)
+                event = {
+                    "event_id": event_id,
+                    "text": text,
+                    "confidence": (
+                        confidence
+                        if confidence is not None
+                        else (assessment or {}).get("confidence", 0.0)
+                    ),
+                    "flags": (flags if flags is not None else (assessment or {}).get("flags", [])),
+                    "now": now if now is not None else time.time(),
+                    "values": values or {},
+                }
+                result = host.on_request(event, assessment=assessment)
+                surface = self._to_surface(session_id, host, result)
+                delivery = self._enqueue_reserved_notification(
+                    notification,
+                    session_id=session_id,
+                    generation=0,
+                    tick_id=surface["turns"],
+                    mutation_seq=surface["turns"],
+                    surface=surface,
+                )
+                enqueued = True
+        except BaseException:
+            if not enqueued:
+                notification.slots.release()
+            raise
+        if _LISTENER_RECORD.get() is None:
+            await asyncio.shield(delivery)
+        return surface
+
+    async def _process_brain_event(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        event_id: str,
+        confidence: float | None,
+        flags: list[str] | None,
+        now: float | None,
+        values: dict[str, float] | None,
+    ) -> Surface:
+        from .compute.brain_errors import BrainDurabilityError, BrainOwnershipError
+        from .compute.brain_store import event_id_digest, session_digest
+
+        key = (session_digest(session_id), event_id_digest(event_id))
+        existing = self._brain_inflight.get(key)
+        if existing is not None:
+            try:
+                outcome = await asyncio.shield(existing)
+            except (BrainDurabilityError, BrainOwnershipError):
+                await self._discard_cached_host(session_id)
+                raise
+            if outcome.delivery is not None and _LISTENER_RECORD.get() is None:
+                await asyncio.shield(outcome.delivery)
+            return outcome.surface
+
+        task = asyncio.create_task(
+            self._process_brain_event_once(
+                session_id,
+                text,
+                event_id=event_id,
+                confidence=confidence,
+                flags=flags,
+                now=now,
+                values=values,
+                session_key=key[0],
+                event_key=key[1],
+            )
+        )
+        self._brain_inflight[key] = task
+
+        def forget(done: asyncio.Task[_ProcessResult]) -> None:
+            if self._brain_inflight.get(key) is done:
+                self._brain_inflight.pop(key, None)
+
+        task.add_done_callback(forget)
+        try:
+            outcome = await asyncio.shield(task)
+        except (BrainDurabilityError, BrainOwnershipError):
+            await self._discard_cached_host(session_id)
+            raise
+        if outcome.delivery is not None and _LISTENER_RECORD.get() is None:
+            await asyncio.shield(outcome.delivery)
+        return outcome.surface
+
+    async def _process_brain_event_once(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        event_id: str,
+        confidence: float | None,
+        flags: list[str] | None,
+        now: float | None,
+        values: dict[str, float] | None,
+        session_key: bytes,
+        event_key: bytes,
+    ) -> _ProcessResult:
+        from .compute.brain_errors import BrainDurabilityError
+        from .compute.brain_store import EventDuplicate
+
+        store = self._brain_store
+        if store is None:
+            raise BrainDurabilityError("brain store is unavailable")
+
+        early = await asyncio.to_thread(store.lookup_event_receipt, session_key, event_key)
+        if isinstance(early, EventDuplicate):
+            async with self._session_lock(session_id):
+                host = await self._get_or_create_host(session_id)
+                surface = self._to_surface(session_id, host, host.diagnostics())
+            return _ProcessResult(
+                self._with_brain_event(
+                    surface,
+                    self._public_event_receipt(
+                        early.receipt,
+                        event_id=event_id,
+                        status="duplicate",
+                    ),
+                ),
+                None,
+            )
+
+        assessment = await self._assess(text) if self._config.assessor_enabled else None
+        notification = await self._reserve_notification(session_id)
+        enqueued = False
+        try:
+            async with self._session_lock(session_id):
+                host = await self._get_or_create_host(session_id)
+                event = {
+                    "event_id": event_id,
+                    "text": text,
+                    "confidence": (
+                        confidence
+                        if confidence is not None
+                        else (assessment or {}).get("confidence", 0.0)
+                    ),
+                    "flags": (flags if flags is not None else (assessment or {}).get("flags", [])),
+                    "now": now if now is not None else time.time(),
+                    "values": values or {},
+                }
+                result = await asyncio.to_thread(host.on_request, event, assessment)
+                committed = await asyncio.to_thread(
+                    store.lookup_event_receipt,
+                    session_key,
+                    event_key,
+                )
+                if not isinstance(committed, EventDuplicate):
+                    raise BrainDurabilityError("brain event returned without a durable receipt")
+                surface = self._to_surface(session_id, host, result)
+                surface = self._with_brain_event(
+                    surface,
+                    self._public_event_receipt(committed.receipt, event_id=event_id),
+                )
+                delivery = self._enqueue_reserved_notification(
+                    notification,
+                    session_id=session_id,
+                    generation=committed.receipt.generation,
+                    tick_id=committed.receipt.tick_id,
+                    mutation_seq=committed.receipt.mutation_seq,
+                    surface=surface,
+                )
+                enqueued = True
+        except BaseException:
+            if not enqueued:
+                notification.slots.release()
+            raise
+        return _ProcessResult(surface, delivery)
+
+    @staticmethod
+    def _public_event_receipt(
+        receipt: StoredReceipt,
+        *,
+        event_id: str,
+        status: str | None = None,
+    ) -> dict[str, object]:
+        return {
+            "status": receipt.status if status is None else status,
+            "event_id": event_id,
+            "generation": receipt.generation,
+            "tick_id": receipt.tick_id,
+            "history_epoch": receipt.history_epoch,
+            "mutation_seq": receipt.mutation_seq,
+        }
+
+    @staticmethod
+    def _with_brain_event(surface: Surface, receipt: dict[str, object]) -> Surface:
+        surface["pipeline"] = {**surface["pipeline"], "brain_event": dict(receipt)}
+        return surface
+
+    async def feedback(
+        self,
+        session_id: str,
+        *,
+        target_tick: int,
+        value: float,
+        confidence: float,
+        source: str,
+        feedback_id: str | None = None,
+    ) -> FeedbackReceipt:
+        """Apply idempotent delayed feedback to one canonical brain event tick."""
+        from .compute.brain_errors import BrainDurabilityError
+        from .compute.brain_state import MAX_COUNTER
+
+        if isinstance(target_tick, bool) or not isinstance(target_tick, int):
+            raise ValueError("target_tick must be an integer")
+        if not 0 <= target_tick <= MAX_COUNTER:
+            raise ValueError("target_tick is outside the persisted counter domain")
+        signal = max(-1.0, min(1.0, _finite_feedback_number(value, name="value")))
+        confidence_value = _finite_feedback_number(confidence, name="confidence")
+        if not 0.0 <= confidence_value <= 1.0:
+            raise ValueError("confidence must be in [0,1]")
+        if not isinstance(source, str) or _FEEDBACK_SOURCE.fullmatch(source) is None:
+            raise ValueError("source must match [A-Za-z0-9][A-Za-z0-9_.:-]{0,63}")
+        canonical_feedback_id = (
+            _generated_feedback_id(
+                source=source,
+                target_tick=target_tick,
+                value=signal,
+                confidence=confidence_value,
+            )
+            if feedback_id is None
+            else _validated_identifier(feedback_id, name="feedback_id")
+        )
+
+        await self._ensure_started()
+        if not self._config.brain_compute.enabled:
+            return FeedbackReceipt(
+                status="disabled",
+                session_id=session_id,
+                target_tick=target_tick,
+                feedback_id=canonical_feedback_id,
+                applied_dimensions=(),
+                applied_synapses=0,
+                mutation_seq=0,
+            )
+
         async with self._session_lock(session_id):
             host = await self._get_or_create_host(session_id)
-            event = {
-                "text": text,
-                "confidence": (
-                    confidence
-                    if confidence is not None
-                    else (assessment or {}).get("confidence", 0.0)
-                ),
-                "flags": (flags if flags is not None else (assessment or {}).get("flags", [])),
-                "now": now if now is not None else time.time(),
-                "values": values or {},
-            }
-            result = host.on_request(event, assessment=assessment)
-            surface = self._to_surface(session_id, host, result)
-            await self._notify(session_id, surface)
-            return surface
+            state = host.brain_state
+            if state is None:
+                raise RuntimeError("brain-enabled host has no authoritative brain state")
+            if target_tick > state.tick_id:
+                raise ValueError("target_tick must not be greater than the current tick")
+            result = await asyncio.to_thread(
+                host.apply_targeted_feedback,
+                feedback_id=canonical_feedback_id,
+                target_tick=target_tick,
+                value=signal,
+                confidence=confidence_value,
+            )
+
+        status = result.get("status")
+        if not isinstance(status, str) or status not in _FEEDBACK_STATUSES:
+            raise BrainDurabilityError(f"invalid targeted feedback status {status!r}")
+        raw_dimensions = result.get("applied_dimensions", ())
+        if not isinstance(raw_dimensions, tuple) or any(
+            isinstance(index, bool) or not isinstance(index, int) for index in raw_dimensions
+        ):
+            raise BrainDurabilityError("targeted feedback dimensions are invalid")
+        raw_synapses = result.get("applied_synapses", 0)
+        if isinstance(raw_synapses, bool) or not isinstance(raw_synapses, int):
+            raise BrainDurabilityError("targeted feedback synapse count is invalid")
+        raw_mutation_seq = result.get("mutation_seq", state.mutation_seq)
+        if isinstance(raw_mutation_seq, bool) or not isinstance(raw_mutation_seq, int):
+            raise BrainDurabilityError("targeted feedback mutation_seq is invalid")
+        return FeedbackReceipt(
+            status=cast(Any, status),
+            session_id=session_id,
+            target_tick=target_tick,
+            feedback_id=canonical_feedback_id,
+            applied_dimensions=raw_dimensions,
+            applied_synapses=raw_synapses,
+            mutation_seq=raw_mutation_seq,
+        )
 
     async def submit(
         self,
@@ -364,9 +907,41 @@ class SylanneEngine:
             FAILED task evicts its own keys immediately — a poisoned entry
             does not get to "stick" for the rest of the window.
         """
+        if self._config.brain_compute.enabled:
+            canonical_event_id = (
+                str(uuid.uuid4())
+                if msg_id is None
+                else _validated_identifier(msg_id, name="msg_id")
+            )
+            if dedup:
+                from .compute.brain_store import event_id_digest, session_digest
+
+                key = (session_digest(session_id), event_id_digest(canonical_event_id))
+                joined = key in self._brain_inflight
+                if joined:
+                    self._stat_joined += 1
+                else:
+                    self._stat_computed += 1
+                self._note_submit_outcome(plugin, joined=joined)
+            return await self.process(
+                session_id,
+                text,
+                confidence=confidence,
+                flags=flags,
+                now=now,
+                values=values,
+                event_id=canonical_event_id,
+            )
+
         if not dedup:
             return await self.process(
-                session_id, text, confidence=confidence, flags=flags, now=now, values=values
+                session_id,
+                text,
+                confidence=confidence,
+                flags=flags,
+                now=now,
+                values=values,
+                event_id=msg_id,
             )
 
         self._prune_submissions()
@@ -432,7 +1007,13 @@ class SylanneEngine:
         keys: tuple[Any, ...] = (key_hash,) if key_msg is None else (key_hash, key_msg)
         task: asyncio.Task[Surface] = asyncio.ensure_future(
             self.process(
-                session_id, text, confidence=confidence, flags=flags, now=now, values=values
+                session_id,
+                text,
+                confidence=confidence,
+                flags=flags,
+                now=now,
+                values=values,
+                event_id=msg_id,
             )
         )
         new_entry = _Submission(
@@ -576,9 +1157,40 @@ class SylanneEngine:
 
     async def reset(self, session_id: str) -> None:
         """Reset session to fresh state. Deletes persisted data."""
-        async with self._session_lock(session_id):
-            if session_id in self._hosts:
-                del self._hosts[session_id]
+        await self._ensure_started()
+        async with self._session_lock(session_id) as entry:
+            if self._config.brain_compute.enabled:
+                from .compute.brain_errors import BrainDurabilityError
+                from .compute.brain_store import session_digest
+
+                store = self._brain_store
+                if store is None:
+                    raise BrainDurabilityError("brain store is unavailable during reset")
+                session_key = session_digest(session_id)
+                control = await asyncio.to_thread(store.control, session_key)
+                if control is not None and control.status == "destroyed":
+                    raise BrainDurabilityError("destroyed session cannot be reset")
+                expected_generation = 0 if control is None else control.generation
+                await self._barrier_notifications(
+                    session_id,
+                    through_generation=expected_generation,
+                )
+                await asyncio.to_thread(
+                    store.reset,
+                    session_key,
+                    expected_generation=expected_generation,
+                )
+            else:
+                await self._barrier_notifications(session_id, through_generation=0)
+                # Non-brain sessions have no durable generation counter: every
+                # process() notification is enqueued with generation 0, so a
+                # persistent generation-0 barrier would permanently silence ALL
+                # future notifications for this session. The barrier above has
+                # already cancelled any in-flight/queued notification, so drop the
+                # drained state; the next process() rebuilds a fresh, unblocked
+                # notification channel.
+                self._notifications.pop(session_id, None)
+            await self._detach_entry_host(entry, flush=False)
             safe_name = safe_filename(session_id)
             for suffix in (".alpha.json", ".json"):
                 state_file = self._data_dir / f"{safe_name}{suffix}"
@@ -587,9 +1199,36 @@ class SylanneEngine:
 
     async def destroy(self, session_id: str) -> None:
         """Permanently remove session state and release its lock."""
-        await self.reset(session_id)
-        if session_id in self._locks:
-            del self._locks[session_id]
+        if not self._config.brain_compute.enabled:
+            await self.reset(session_id)
+            return
+
+        from .compute.brain_errors import BrainDurabilityError
+        from .compute.brain_store import session_digest
+
+        await self._ensure_started()
+        async with self._session_lock(session_id) as entry:
+            store = self._brain_store
+            if store is None:
+                raise BrainDurabilityError("brain store is unavailable during destroy")
+            session_key = session_digest(session_id)
+            control = await asyncio.to_thread(store.control, session_key)
+            expected_generation = 0 if control is None else control.generation
+            await self._barrier_notifications(
+                session_id,
+                through_generation=expected_generation,
+            )
+            await asyncio.to_thread(
+                store.destroy,
+                session_key,
+                expected_generation=expected_generation,
+            )
+            await self._detach_entry_host(entry, flush=False)
+            safe_name = safe_filename(session_id)
+            for suffix in (".alpha.json", ".json"):
+                state_file = self._data_dir / f"{safe_name}{suffix}"
+                if state_file.exists():
+                    state_file.unlink()
 
     async def inject(
         self,
@@ -818,19 +1457,325 @@ class SylanneEngine:
 
     # --- internal ---
 
-    async def _notify(self, session_id: str, surface: Surface) -> None:
-        for listener in self._listeners:
+    async def _reserve_notification(self, session_id: str) -> _NotificationState:
+        from .compute.brain_errors import BrainNotificationBackpressureError
+
+        if not self._notifications_accepting:
+            raise BrainNotificationBackpressureError("notification admission is closed")
+        state = self._notifications.get(session_id)
+        if state is None:
+            state = _NotificationState()
+            self._notifications[session_id] = state
+        await state.slots.acquire(nonblocking=_LISTENER_RECORD.get() is not None)
+        if not self._notifications_accepting:
+            state.slots.release()
+            raise BrainNotificationBackpressureError("notification admission closed while waiting")
+        return state
+
+    def _enqueue_reserved_notification(
+        self,
+        state: _NotificationState,
+        *,
+        session_id: str,
+        generation: int,
+        tick_id: int,
+        mutation_seq: int,
+        surface: Surface,
+    ) -> asyncio.Future[None]:
+        loop = asyncio.get_running_loop()
+        completion = loop.create_future()
+        record = _NotificationRecord(
+            session_id=session_id,
+            generation=generation,
+            tick_id=tick_id,
+            mutation_seq=mutation_seq,
+            surface=surface,
+            listeners=tuple(self._listeners),
+            completion=completion,
+        )
+        self._notification_pending.add(completion)
+        completion.add_done_callback(self._notification_pending.discard)
+        if generation <= state.blocked_through_generation:
+            self._finish_notification(state, record)
+            return completion
+        if not record.listeners:
+            record.released = True
+            state.slots.release()
+            completion.set_result(None)
+            return completion
+        state.queue.append(record)
+        if state.worker is None or state.worker.done():
+            state.worker = asyncio.create_task(self._notification_worker(state))
+        return completion
+
+    async def _notification_worker(self, state: _NotificationState) -> None:
+        try:
+            while state.queue:
+                record = state.queue.popleft()
+                state.current = record
+                try:
+                    await self._deliver_notification(record)
+                finally:
+                    self._finish_notification(state, record)
+                    state.current = None
+        finally:
+            current = state.current
+            if current is not None:
+                self._finish_notification(state, current)
+                state.current = None
+            while state.queue:
+                self._finish_notification(state, state.queue.popleft())
+            state.worker = None
+
+    async def _deliver_notification(self, record: _NotificationRecord) -> None:
+        for listener in record.listeners:
+            if record.stop_after_current_callback:
+                break
+            token = _LISTENER_RECORD.set(record)
             try:
-                ret = listener(session_id, surface)
-                if asyncio.iscoroutine(ret) or asyncio.isfuture(ret):
-                    await ret
+                returned = listener(record.session_id, record.surface)
+                if inspect.isawaitable(returned):
+                    listener_task = asyncio.ensure_future(returned)
+                    self._listener_tasks.add(listener_task)
+                    listener_task.add_done_callback(self._listener_task_done)
+                    done, _ = await asyncio.wait(
+                        (listener_task,),
+                        timeout=_LISTENER_TIMEOUT_SECONDS,
+                    )
+                    if not done:
+                        listener_task.cancel()
+                        logger.warning(
+                            "Listener timed out after %.1fs for session %r",
+                            _LISTENER_TIMEOUT_SECONDS,
+                            record.session_id,
+                        )
+                    else:
+                        try:
+                            listener_task.result()
+                        except asyncio.CancelledError:
+                            logger.warning("Listener cancelled itself", exc_info=True)
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.warning("Listener error", exc_info=True)
+            finally:
+                _LISTENER_RECORD.reset(token)
+            if record.stop_after_current_callback:
+                break
 
-    def _session_lock(self, session_id: str) -> asyncio.Lock:
-        if session_id not in self._locks:
-            self._locks[session_id] = asyncio.Lock()
-        return self._locks[session_id]
+    def _listener_task_done(self, future: asyncio.Future[Any]) -> None:
+        self._listener_tasks.discard(future)
+        if future.cancelled():
+            return
+        try:
+            future.exception()
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    @staticmethod
+    def _finish_notification(
+        state: _NotificationState,
+        record: _NotificationRecord,
+    ) -> None:
+        if record.released:
+            return
+        record.released = True
+        state.slots.release()
+        if not record.completion.done():
+            record.completion.set_result(None)
+
+    async def drain_notifications(self, *, timeout: float | None = None) -> None:
+        """Wait until every notification accepted so far has finished delivery."""
+        loop = asyncio.get_running_loop()
+        if timeout is not None and (not math.isfinite(timeout) or timeout < 0.0):
+            raise ValueError("timeout must be finite and nonnegative")
+        deadline = None if timeout is None else loop.time() + timeout
+        while True:
+            pending = tuple(future for future in self._notification_pending if not future.done())
+            if not pending:
+                return
+            remaining = None if deadline is None else max(0.0, deadline - loop.time())
+            done, _ = await asyncio.wait(
+                pending,
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                raise TimeoutError("notification drain timed out")
+
+    async def _barrier_notifications(
+        self,
+        session_id: str,
+        *,
+        through_generation: int,
+        timeout: float = 30.0,
+    ) -> None:
+        state = self._notifications.get(session_id)
+        if state is None:
+            return
+        state.blocked_through_generation = max(
+            state.blocked_through_generation,
+            through_generation,
+        )
+        current = state.current
+        wait_for_current: asyncio.Future[None] | None = None
+        if current is not None and current.generation <= through_generation:
+            current.stop_after_current_callback = True
+            if current is not _LISTENER_RECORD.get():
+                wait_for_current = current.completion
+
+        retained: deque[_NotificationRecord] = deque()
+        while state.queue:
+            record = state.queue.popleft()
+            if record.generation <= through_generation:
+                record.stop_after_current_callback = True
+                self._finish_notification(state, record)
+            else:
+                retained.append(record)
+        state.queue = retained
+
+        if wait_for_current is None or wait_for_current.done():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(wait_for_current), timeout=timeout)
+        except TimeoutError:
+            worker = state.worker
+            if worker is not None and not worker.done():
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+
+    async def _shutdown_notifications(self) -> None:
+        from .compute.brain_errors import BrainNotificationBackpressureError
+
+        self._notifications_accepting = False
+        admission_error = BrainNotificationBackpressureError(
+            "engine is shutting down notification admission"
+        )
+        for state in self._notifications.values():
+            state.slots.close(admission_error)
+        try:
+            await self.drain_notifications(timeout=30.0)
+        except TimeoutError:
+            workers = [
+                state.worker
+                for state in self._notifications.values()
+                if state.worker is not None and not state.worker.done()
+            ]
+            for worker in workers:
+                worker.cancel()
+            if workers:
+                await asyncio.gather(*workers, return_exceptions=True)
+        for listener_task in tuple(self._listener_tasks):
+            listener_task.cancel()
+        self._notifications.clear()
+        self._notification_pending.clear()
+
+    def _session_lock(self, session_id: str) -> _SessionLease:
+        return _SessionLease(self, session_id)
+
+    async def _retain_session_entry(self, session_id: str) -> _SessionEntry:
+        async with self._host_condition:
+            while True:
+                entry = self._session_entries.get(session_id)
+                if entry is None:
+                    entry = _SessionEntry(session_id=session_id)
+                    self._session_entries[session_id] = entry
+                    self._locks[session_id] = entry.lock
+                if entry.eviction_reserved:
+                    await self._host_condition.wait()
+                    continue
+                entry.references += 1
+                entry.waiters += 1
+                self._session_entries.move_to_end(session_id)
+                if session_id in self._hosts:
+                    self._hosts.move_to_end(session_id)
+                return entry
+
+    async def _promote_session_owner(self, entry: _SessionEntry) -> None:
+        async with self._host_condition:
+            entry.waiters -= 1
+            entry.owners += 1
+
+    async def _release_session_waiter(self, entry: _SessionEntry) -> None:
+        async with self._host_condition:
+            entry.waiters -= 1
+            entry.references -= 1
+            self._drop_empty_entry_locked(entry)
+            self._host_condition.notify_all()
+
+    async def _release_session_owner(self, entry: _SessionEntry) -> None:
+        async with self._host_condition:
+            entry.owners -= 1
+            entry.references -= 1
+            self._drop_empty_entry_locked(entry)
+            self._schedule_host_trim_locked()
+            self._host_condition.notify_all()
+
+    def _drop_empty_entry_locked(self, entry: _SessionEntry) -> None:
+        if entry.references or entry.host is not None or entry.eviction_reserved:
+            return
+        if self._session_entries.get(entry.session_id) is entry:
+            self._session_entries.pop(entry.session_id, None)
+            self._locks.pop(entry.session_id, None)
+
+    def _schedule_host_trim_locked(self) -> None:
+        task = self._host_trim_task
+        if len(self._hosts) <= self._config.brain_compute.hot_session_limit:
+            return
+        if task is None or task.done():
+            self._host_trim_task = asyncio.create_task(self._trim_overflow_hosts())
+
+    async def _trim_overflow_hosts(self) -> None:
+        failed = False
+        deferred = False
+        try:
+            while True:
+                candidate: tuple[_SessionEntry, SylanneHost, int] | None = None
+                async with self._host_condition:
+                    if len(self._hosts) <= self._config.brain_compute.hot_session_limit:
+                        return
+                    for entry in self._session_entries.values():
+                        if (
+                            entry.host is not None
+                            and entry.references == 0
+                            and not entry.eviction_reserved
+                        ):
+                            entry.eviction_reserved = True
+                            candidate = (entry, entry.host, entry.epoch)
+                            break
+                    if candidate is None:
+                        deferred = True
+                        return
+                try:
+                    await self._evict_reserved_host(*candidate)
+                except Exception:
+                    failed = True
+                    logger.warning("background Host eviction failed", exc_info=True)
+                    return
+        finally:
+            async with self._host_condition:
+                if self._host_trim_task is asyncio.current_task():
+                    self._host_trim_task = None
+                if not failed and not deferred:
+                    self._schedule_host_trim_locked()
+                self._host_condition.notify_all()
+
+    async def _detach_entry_host(self, entry: _SessionEntry, *, flush: bool) -> None:
+        async with self._host_condition:
+            host = entry.host
+            if host is None:
+                return
+            entry.epoch += 1
+            entry.host = None
+            entry.eviction_reserved = False
+            if self._hosts.get(entry.session_id) is host:
+                self._hosts.pop(entry.session_id, None)
+            self._host_condition.notify_all()
+        await asyncio.to_thread(host.close, flush=flush)
+
+    async def _discard_cached_host(self, session_id: str) -> None:
+        async with self._session_lock(session_id) as entry:
+            await self._detach_entry_host(entry, flush=False)
 
     async def set_relationship(self, session_id: str, relationship: float) -> None:
         """v26 D2：host 显式供给会话的关系相位标量 R ∈ [0,1]（标定呈报 D2 选项 a）。
@@ -865,6 +1810,8 @@ class SylanneEngine:
             affect_slowchannel=self._config.affect_slowchannel_enabled,
             affect_plasticity=self._config.affect_plasticity_enabled,
             affect_full_takeover=self._config.affect_full_takeover,
+            brain_compute=self._config.brain_compute,
+            brain_store=self._brain_store,
         )
 
     async def _get_or_create_host(self, session_id: str) -> SylanneHost:
@@ -877,11 +1824,112 @@ class SylanneEngine:
         race); same-id concurrency is already serialized by the per-session lock,
         so the post-await re-check simply joins a host built while we awaited.
         """
-        host = self._hosts.get(session_id)
-        if host is None:
+        async with self._host_condition:
+            entry = self._session_entries.get(session_id)
+            if entry is None or entry.references <= 0:
+                raise RuntimeError("session Host access requires an active session lease")
+            host = entry.host
+            if host is not None:
+                self._session_entries.move_to_end(session_id)
+                self._hosts.move_to_end(session_id)
+                return host
+            epoch = entry.epoch
+
+        await self._reserve_host_build_slot()
+        try:
             built = await asyncio.to_thread(self._build_host, session_id)
-            host = self._hosts.setdefault(session_id, built)
-        return host
+        except BaseException:
+            await self._release_host_build_slot()
+            raise
+
+        stale = False
+        existing: SylanneHost | None = None
+        async with self._host_condition:
+            self._host_build_reservations -= 1
+            current = self._session_entries.get(session_id)
+            if current is not entry or entry.epoch != epoch:
+                stale = True
+                existing = None if current is None else current.host
+            elif entry.host is None:
+                entry.host = built
+                self._hosts[session_id] = built
+                self._session_entries.move_to_end(session_id)
+                self._hosts.move_to_end(session_id)
+            else:
+                stale = True
+                existing = entry.host
+            self._host_condition.notify_all()
+
+        if stale:
+            await asyncio.to_thread(built.close, flush=False)
+            if existing is not None:
+                return existing
+            return await self._get_or_create_host(session_id)
+        return built
+
+    async def _reserve_host_build_slot(self) -> None:
+        hot_limit = self._config.brain_compute.hot_session_limit
+        overflow_limit = hot_limit + 8
+        while True:
+            candidate: tuple[_SessionEntry, SylanneHost, int] | None = None
+            async with self._host_condition:
+                charged = len(self._hosts) + self._host_build_reservations
+                if charged < hot_limit:
+                    self._host_build_reservations += 1
+                    return
+                for entry in self._session_entries.values():
+                    if (
+                        entry.host is not None
+                        and entry.references == 0
+                        and not entry.eviction_reserved
+                    ):
+                        entry.eviction_reserved = True
+                        candidate = (entry, entry.host, entry.epoch)
+                        break
+                if candidate is None:
+                    if charged < overflow_limit:
+                        self._host_build_reservations += 1
+                        return
+                    await self._host_condition.wait()
+                    continue
+            await self._evict_reserved_host(*candidate)
+
+    async def _release_host_build_slot(self) -> None:
+        async with self._host_condition:
+            self._host_build_reservations -= 1
+            self._host_condition.notify_all()
+
+    async def _evict_reserved_host(
+        self,
+        entry: _SessionEntry,
+        host: SylanneHost,
+        epoch: int,
+    ) -> None:
+        try:
+            await asyncio.to_thread(host.close, flush=True)
+        except BaseException:
+            async with self._host_condition:
+                if self._session_entries.get(entry.session_id) is entry:
+                    entry.eviction_reserved = False
+                self._host_condition.notify_all()
+            raise
+
+        async with self._host_condition:
+            if (
+                self._session_entries.get(entry.session_id) is entry
+                and entry.eviction_reserved
+                and entry.references == 0
+                and entry.epoch == epoch
+                and entry.host is host
+            ):
+                entry.host = None
+                entry.eviction_reserved = False
+                self._hosts.pop(entry.session_id, None)
+                self._session_entries.pop(entry.session_id, None)
+                self._locks.pop(entry.session_id, None)
+            elif self._session_entries.get(entry.session_id) is entry:
+                entry.eviction_reserved = False
+            self._host_condition.notify_all()
 
     def _ctx_fingerprint(
         self,

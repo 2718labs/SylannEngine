@@ -18,9 +18,10 @@ from __future__ import annotations
 from ._sharing import SharedEngineConflictError
 from .algebra import blend, compose, decay, distance, drift, normalize, project, threshold
 from .bridge import layer0_to_interchange, state_to_pad, surface_to_layer0
+from .compute.brain_backend import get_brain_backend_factory, register_brain_backend
 from .compute.hot_pool import HotPool, Influence, InfluenceType
 from .compute.pad_interop import PADProjector, PADVector
-from .config import DimensionProfile, SylanneConfig, build_profile
+from .config import BrainComputeConfig, DimensionProfile, SylanneConfig, build_profile
 from .contagion import ContagionEvent, ContagionGraph, GroupDynamics, InfluenceFilter
 from .engine import SylanneEngine
 from .expression import (
@@ -36,19 +37,22 @@ from .expression import (
 from .schema import SYLANNE_SCHEMA
 from .schema import validate as validate_schema
 from .standard import EmotionVector, SylanneCore, SylanneState, SylanneStimulus
-from .types import EngineStatus, HealthStatus, PADOutput, Surface
+from .types import EngineStatus, FeedbackReceipt, HealthStatus, PADOutput, Surface
 
 __all__ = [
     # Engine & config
     "SylanneEngine",
     "SharedEngineConflictError",
     "SylanneConfig",
+    "BrainComputeConfig",
     "SylanneCore",
     "SylanneStimulus",
     "SylanneState",
     "EmotionVector",
     "DimensionProfile",
     "build_profile",
+    "register_brain_backend",
+    "get_brain_backend_factory",
     # Hot pool
     "HotPool",
     "Influence",
@@ -64,6 +68,7 @@ __all__ = [
     "Surface",
     "EngineStatus",
     "HealthStatus",
+    "FeedbackReceipt",
     # Bridge
     "state_to_pad",
     "surface_to_layer0",

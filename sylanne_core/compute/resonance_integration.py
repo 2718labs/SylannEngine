@@ -24,13 +24,15 @@ import logging
 import math
 import time
 from collections import deque
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from .._numeric import _coerce_float
 from . import affect_projection
 from . import pel_core as _pel_core  # module ref so SEMANTIC_PRIOR stays monkeypatchable
 from .autopoiesis import AutopoieticBoundary
 from .bounded_dict import BoundedDict
+from .brain_c import Route
+from .brain_errors import BrainDurabilityError, BrainOwnershipError
 from .deterministic_fusion import create_deterministic_fusion
 from .emergence import EmergenceTracker
 from .expression_policy import ExpressionPolicy
@@ -51,7 +53,7 @@ from .phase_transition import PhaseTransitionExpression
 from .predictive_coding import PredictiveCodingGate
 from .relational_sheaf import ScarSheaf
 from .slow_channel import SlowChannel
-from .void_scar_engine import VoidScarEngine
+from .void_scar_engine import BrainSessionContext, VoidScarEngine, project_brain_assessment
 
 if TYPE_CHECKING:
     from ..config import DimensionProfile
@@ -153,6 +155,7 @@ class ResonanceSpine:
         affect_slowchannel: bool = False,
         affect_plasticity: bool = False,
         affect_full_takeover: bool = False,
+        brain_context: BrainSessionContext | None = None,
     ):
         if profile is None:
             from ..config import build_profile
@@ -183,6 +186,7 @@ class ResonanceSpine:
             scar_mlp_passes=profile.scar_mlp_passes,
             pel_enabled=pel_enabled,
             affect_enabled=affect_enabled,
+            brain_context=brain_context,
         )
         self._sheaf = ScarSheaf(n0=profile.stalk_dim)
         self._hgt = HeterogeneousGraphTransformer(
@@ -414,6 +418,7 @@ class ResonanceSpine:
         session_key: str = "",
         dialogue_quality: float | None = None,
         expression_outcome: bool | None = None,
+        event_id: str | None = None,
     ) -> dict[str, Any]:
         """Process one input message through the modules and produce a result dict.
 
@@ -440,7 +445,10 @@ class ResonanceSpine:
                 传入（与 dialogue_quality 同款滞后通道）。若提供，会覆盖 result["should_express"]
                 中 policy 的猜测值，使 expression_fired 漂移信号反映真实裁决而非策略预测。
         """
-        if not text or not text.strip():
+        is_blank = not text or not text.strip()
+        if is_blank:
+            if self._engine.brain_enabled:
+                self._engine.commit_neutral_brain_event(event_id)
             self._route_counts["skip"] = self._route_counts.get("skip", 0) + 1
             self._boundary.self_repair()
             return self._build_result("", timestamp, False)
@@ -452,6 +460,8 @@ class ResonanceSpine:
         # assessment.get(...). Field-level None/non-numeric is handled later by _coerce_float.
         if assessment is not None and not isinstance(assessment, dict):
             assessment = None
+        brain_enabled = self._engine.brain_enabled
+        sparse_routing = brain_enabled and self._engine.sparse_routing
 
         # Apply per-relationship personality overlay if session changed or dirty
         if session_key != self._last_effective_session or self._personality_dirty:
@@ -469,6 +479,8 @@ class ResonanceSpine:
         if dialogue_quality is not None:
             try:
                 self._engine.scar_state.apply_affect_quality(float(dialogue_quality))
+            except (BrainDurabilityError, BrainOwnershipError):
+                raise
             except Exception:  # pragma: no cover - learning must never crash a turn
                 logger.debug("affect plasticity hook (resonance) skipped", exc_info=True)
 
@@ -490,19 +502,47 @@ class ResonanceSpine:
         self._field.inject(0, hdc_signal)
 
         # === Module 1: Predictive Coding Gate ===
-        surprise = self._gate.surprise(h)
-        self._gate.update(h, surprise)
+        surprise = 0.0 if is_blank else self._gate.surprise(h)
+        route: Route = "normal"
+        if sparse_routing:
+            route = cast(Route, self._gate.route(surprise))
+            self._gate.update_stable(h, surprise, cast(str, event_id))
+            self._last_route = route
+            self._route_counts[route] = self._route_counts.get(route, 0) + 1
+        else:
+            self._gate.update(h, surprise)
         self._last_surprise = surprise
         gate_signal = [surprise * 0.5] * self._field.state_dim
         self._field.inject(1, gate_signal)
 
         # === Module 2: VoidScar Engine ===
-        ssm_input = self._hdc_to_ssm_input(h, surprise)
+        ssm_input = (
+            [0.0] * self._engine.scar_state.n_dims
+            if is_blank
+            else self._hdc_to_ssm_input(h, surprise)
+        )
+        projected_assessment: list[float] | None = None
+        assessment_wound: list[float] | None = None
+        if brain_enabled:
+            projected_assessment, assessment_wound = project_brain_assessment(assessment)
         engine_result = self._engine.process(
             event_vec=bytes(h),
             ssm_input=ssm_input,
             surprise=surprise,
             timestamp=timestamp,
+            event_id=event_id,
+            projected_assessment=projected_assessment,
+            assessment_wound=assessment_wound,
+            route=route,
+            perception_acuity=_coerce_float(
+                self._personality.get(
+                    "perception_acuity",
+                    self._personality.get("neuroticism", 0.5),
+                ),
+                0.0,
+                1.0,
+                0.5,
+            ),
         )
         # D-10: non-semantic assessor-advisable gate. Wound hints come from the
         # engine's own coupling wounds / fresh scars this tick (no assessor needed).
@@ -521,7 +561,7 @@ class ResonanceSpine:
         wound_hint = bool(engine_result.get("coupling_wounds")) or bool(new_scars)
         low_surprise = surprise < self._gate.mean_surprise()
         self._last_assessor_advisable = (not low_surprise) or wound_hint
-        if assessment:
+        if assessment and not self._engine.brain_enabled:
             self._apply_assessment_to_engine(assessment)
         emotion = self._engine.observe()
         void_signal = [
@@ -539,7 +579,10 @@ class ResonanceSpine:
         self._field.inject(2, void_signal[: self._field.state_dim])
 
         # === Module 3: Relational Sheaf ===
-        sheaf_result = self._sheaf.tick(0, ssm_input, timestamp=timestamp)
+        run_sparse_optional = not (sparse_routing and route != "full")
+        sheaf_result = (
+            self._sheaf.tick(0, ssm_input, timestamp=timestamp) if run_sparse_optional else {}
+        )
         sheaf_energy = float(
             sheaf_result.get("energy", 0.0) if isinstance(sheaf_result, dict) else 0.0
         )
@@ -547,21 +590,27 @@ class ResonanceSpine:
         self._field.inject(3, sheaf_signal)
 
         # === Module 4: HGT Decision ===
-        hgt_tokens = self._hgt.build_tokens_from_spine(
-            scar_state=self._engine.scar_state,
-            void_space=self._engine.void_space,
-            boundary=self._boundary,
-            personality=self._personality,
-            surprise=surprise,
-            expression=self._expression,
-            hdc_features=ssm_input,
-        )
-        hgt_decision = self._hgt.forward(hgt_tokens, self._personality)
+        if run_sparse_optional:
+            hgt_tokens = self._hgt.build_tokens_from_spine(
+                scar_state=self._engine.scar_state,
+                void_space=self._engine.void_space,
+                boundary=self._boundary,
+                personality=self._personality,
+                surprise=surprise,
+                expression=self._expression,
+                hdc_features=ssm_input,
+            )
+            hgt_decision = self._hgt.forward(hgt_tokens, self._personality)
+        else:
+            hgt_decision = [0.0, 0.0, 0.0, 0.0]
         hgt_signal = list(hgt_decision) + [0.0] * (self._field.state_dim - len(hgt_decision))
         self._field.inject(4, hgt_signal[: self._field.state_dim])
 
         # === Module 5: Autopoietic Boundary ===
         force = self._emotion_to_boundary_force(emotion)
+        if sparse_routing:
+            force_scale = {"fast": 0.1, "normal": 0.3, "full": 1.0}[route]
+            force = [value * force_scale for value in force]
         boundary_result = self._boundary.perturb(force)
         self._boundary.self_repair()
         stability = self._boundary.stability()
@@ -753,6 +802,8 @@ class ResonanceSpine:
         direct_affect = not (_pel_core.SEMANTIC_PRIOR and self._engine.scar_state.pel_active())
         if direct_affect and not took_over:
             base = self._engine.scar_state.base
+            if not isinstance(base, list):
+                raise BrainOwnershipError("legacy assessment cannot write brain-owned base")
             if n > 2 and abs(valence) > 1e-6:
                 base[2] = max(-1.0, min(1.0, base[2] + valence * gain))
             if n > 1 and arousal > 1e-6:
@@ -778,6 +829,8 @@ class ResonanceSpine:
                 self._engine.scar_state.apply_affect_appraisal_shadow(
                     valence, arousal, wound_risk, intent_s
                 )
+            except (BrainDurabilityError, BrainOwnershipError):
+                raise
             except Exception:  # pragma: no cover - diagnostic path, must never crash a turn
                 logger.debug("affect-shadow appraisal (resonance) skipped", exc_info=True)
 
@@ -787,6 +840,8 @@ class ResonanceSpine:
             try:
                 a_k, _ = affect_projection.project_appraisal(valence, arousal, wound_risk, intent_s)
                 self._slow_channel.observe(a_k)
+            except (BrainDurabilityError, BrainOwnershipError):
+                raise
             except Exception:  # pragma: no cover - fail-closed
                 logger.debug("slow-channel observe (resonance) skipped", exc_info=True)
 
@@ -1211,10 +1266,8 @@ class ResonanceSpine:
             self._field.from_dict(data["field"])
         if "engine" in data:
             engine_data = data["engine"]
-            from .scar_algebra import ScarredState
-
             if "scar" in engine_data:
-                self._engine.scar_state = ScarredState.from_dict(
+                self._engine.restore_scar_state(
                     engine_data["scar"],
                     pel_enabled=self._pel_enabled,
                     affect_enabled=self._affect_enabled,

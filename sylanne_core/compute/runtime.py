@@ -15,9 +15,13 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ..config import BrainComputeConfig
 from .body import SCHEMA_VERSION
+from .brain_errors import BrainDurabilityError
+from .brain_store import BrainStateStore
 from .kernel import AlphaKernel
 from .utils import safe_filename
+from .void_scar_engine import BrainSessionContext
 
 if TYPE_CHECKING:
     from ..config import DimensionProfile
@@ -45,6 +49,8 @@ class AlphaRuntime:
         affect_slowchannel: bool = False,
         affect_plasticity: bool = False,
         affect_full_takeover: bool = False,
+        brain_compute: BrainComputeConfig | None = None,
+        brain_store: BrainStateStore | None = None,
     ):
         """初始化运行时，指定持久化根目录。
 
@@ -66,7 +72,23 @@ class AlphaRuntime:
         self._affect_slowchannel = affect_slowchannel
         self._affect_plasticity = affect_plasticity
         self._affect_full_takeover = affect_full_takeover
+        self._brain_compute = brain_compute or BrainComputeConfig()
+        self._brain_store = brain_store
+        if self._brain_compute.enabled and self._brain_store is None:
+            raise BrainDurabilityError("brain-enabled runtime requires a shared BrainStateStore")
         self._save_count: int = 0
+
+    def _brain_context(self, session_key: str) -> BrainSessionContext | None:
+        if not self._brain_compute.enabled:
+            return None
+        store = self._brain_store
+        if store is None:  # pragma: no cover - constructor enforces this invariant
+            raise BrainDurabilityError("brain store is unavailable")
+        return BrainSessionContext(
+            config=self._brain_compute,
+            store=store,
+            session_id=session_key,
+        )
 
     def load(self, session_key: str, legacy: dict[str, Any] | None = None) -> AlphaKernel:
         """加载指定 session 的 kernel 状态。
@@ -84,6 +106,7 @@ class AlphaRuntime:
             恢复或新建的 AlphaKernel 实例。
         """
         path = self._path(session_key)
+        brain_context = self._brain_context(session_key)
         if path.exists():
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
@@ -100,6 +123,7 @@ class AlphaRuntime:
                     affect_slowchannel=self._affect_slowchannel,
                     affect_plasticity=self._affect_plasticity,
                     affect_full_takeover=self._affect_full_takeover,
+                    brain_context=brain_context,
                 )
                 self.save(recovered)
                 return recovered
@@ -113,6 +137,7 @@ class AlphaRuntime:
                     affect_slowchannel=self._affect_slowchannel,
                     affect_plasticity=self._affect_plasticity,
                     affect_full_takeover=self._affect_full_takeover,
+                    brain_context=brain_context,
                 )
             return AlphaKernel.boot(
                 session_key=session_key,
@@ -124,6 +149,7 @@ class AlphaRuntime:
                 affect_slowchannel=self._affect_slowchannel,
                 affect_plasticity=self._affect_plasticity,
                 affect_full_takeover=self._affect_full_takeover,
+                brain_context=brain_context,
             )
         return AlphaKernel.boot(
             session_key=session_key,
@@ -135,6 +161,7 @@ class AlphaRuntime:
             affect_slowchannel=self._affect_slowchannel,
             affect_plasticity=self._affect_plasticity,
             affect_full_takeover=self._affect_full_takeover,
+            brain_context=brain_context,
         )
 
     def save(self, kernel: AlphaKernel) -> None:
@@ -177,6 +204,7 @@ class AlphaRuntime:
             affect_slowchannel=self._affect_slowchannel,
             affect_plasticity=self._affect_plasticity,
             affect_full_takeover=self._affect_full_takeover,
+            brain_context=self._brain_context(session_key),
         )
         self.save(kernel)
         return kernel
