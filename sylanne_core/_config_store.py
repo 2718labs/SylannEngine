@@ -32,7 +32,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from .config import SylanneConfig
+from .config import BrainComputeConfig, SylanneConfig
 
 logger = logging.getLogger("sylanne_core")
 
@@ -67,6 +67,11 @@ def load_config(data_dir: str | Path) -> tuple[SylanneConfig, dict[str, Any] | N
     known = {f.name for f in dataclasses.fields(SylanneConfig)}
     kwargs = {k: v for k, v in data.items() if k in known}
     try:
+        if "brain_compute" in kwargs:
+            brain_data = kwargs["brain_compute"]
+            if not isinstance(brain_data, dict):
+                raise TypeError("brain_compute must be a JSON object")
+            kwargs["brain_compute"] = BrainComputeConfig(**brain_data)
         cfg = SylanneConfig(**kwargs)
     except (TypeError, ValueError) as exc:
         logger.warning("invalid config in %s (%s); using defaults", path, exc)

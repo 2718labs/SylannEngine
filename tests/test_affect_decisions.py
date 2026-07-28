@@ -183,6 +183,10 @@ class TestRelationshipWiring:
             await engine.set_relationship("s", 1.5)  # 越界拒绝
         await engine.set_relationship("s", 0.9)
         await engine.process("s", "你好")
-        host = await engine._get_or_create_host("s")
-        assert host.kernel.computation._engine.scar_state._relationship == 0.9
+        # v26: direct host access now requires an active session lease (LRU-safety
+        # invariant added by the brain single-writer work); public APIs above take
+        # their own lease, so only this internal probe needs to hold one.
+        async with engine._session_lock("s"):
+            host = await engine._get_or_create_host("s")
+            assert host.kernel.computation._engine.scar_state._relationship == 0.9
         await engine.shutdown()

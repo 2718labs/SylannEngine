@@ -15,11 +15,13 @@ from __future__ import annotations
 import logging
 import math
 import statistics
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
 from . import affect_dynamics, affect_projection
+from .brain_errors import BrainOwnershipError
 from .pel_core import N as _PEL_N
 from .pel_core import PELCore
 
@@ -130,7 +132,8 @@ class ScarredState:
     """
 
     __slots__ = (
-        "base",
+        "_base",
+        "_brain_capability",
         "scars",
         "n_dims",
         "wound_threshold",
@@ -194,10 +197,17 @@ class ScarredState:
         *,
         pel_enabled: bool = False,
         affect_enabled: bool = False,
+        brain_capability: object | None = None,
+        authoritative_base: Sequence[float] | None = None,
     ):
         self.n_dims = n_dims
         self.wound_threshold = wound_threshold
-        self.base = [0.0] * n_dims
+        self._brain_capability = brain_capability
+        self._base: list[float] | tuple[float, ...] = (
+            (0.0,) * n_dims if brain_capability is not None else [0.0] * n_dims
+        )
+        if authoritative_base is not None:
+            self._replace_base(authoritative_base, brain_capability)
         self.scars: list[Scar] = []
         self._tick = 0
         self._neuroticism: float = 0.5
@@ -244,6 +254,39 @@ class ScarredState:
         self._affect_phi: list[float] = [0.0] * n_dims
         self._affect_q_ema: float = 0.5
         self._e_ver: int = 0
+
+    @property
+    def base(self) -> list[float] | tuple[float, ...]:
+        """Current base vector, immutable while the authoritative brain owns it."""
+        return self._base
+
+    @base.setter
+    def base(self, candidate: Sequence[float]) -> None:
+        if self._brain_capability is not None:
+            raise BrainOwnershipError("authoritative brain base requires its matching capability")
+        self._replace_legacy_base(candidate)
+
+    def _replace_base(self, candidate: Sequence[float], capability: object | None) -> None:
+        """Replace the complete base vector after proving writer ownership."""
+        if capability is not self._brain_capability:
+            raise BrainOwnershipError("stale or foreign brain base capability")
+        try:
+            values = tuple(float(value) for value in candidate)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("base must be a finite numeric sequence") from exc
+        if len(values) != self.n_dims:
+            raise ValueError(f"base must contain exactly {self.n_dims} dimensions")
+        if any(not math.isfinite(value) or not -1.0 <= value <= 1.0 for value in values):
+            raise ValueError("base dimensions must be finite values in [-1, 1]")
+        self._base = values if self._brain_capability is not None else list(values)
+
+    def _replace_legacy_base(self, candidate: Sequence[float]) -> None:
+        """Route legacy whole-vector writes through the single replacement gate."""
+        if self._brain_capability is not None:
+            raise BrainOwnershipError(
+                "legacy base evolution cannot write authoritative brain state"
+            )
+        self._replace_base(candidate, None)
 
     def set_healing_rates(
         self, t_raw: int, t_closing: int, t_scarred: int, neuroticism: float = 0.5
@@ -422,7 +465,7 @@ class ScarredState:
             # **之前**推进，异常时时钟白走、该区间的衰减被永久静默丢弃；现在异常
             # ⇒ 时钟留在 prev，恢复后的下一次成功衰减补齐全部真实间隔）。
             if takeover:
-                self.base = decayed  # T3: authoritative base
+                self._replace_legacy_base(decayed)  # T3 legacy takeover path
                 self._e_ver += 1
             else:
                 self._affect_shadow_base = decayed
@@ -446,9 +489,9 @@ class ScarredState:
             a_k, matched = affect_projection.project_appraisal(valence, arousal, wound_risk, intent)
             gain = self._effective_gain()
             affect_dynamics.validate_gain(gain)  # 越界抛 → 下方兜底回落手写规则
-            unit = affect_dynamics.to_unit_interval(self.base)
+            unit = affect_dynamics.to_unit_interval(list(self.base))
             updated = affect_dynamics.saturating_update(unit, a_k, gain)
-            self.base = affect_dynamics.from_unit_interval(updated)
+            self._replace_legacy_base(affect_dynamics.from_unit_interval(updated))
             self._e_ver += 1
             # A.2：可塑性开启时更新资格迹——只有参与本轮情绪反应的维度在下一次
             # quality 反馈到达时领赏罚（注 6.2 信用分配）。
@@ -729,7 +772,9 @@ class ScarredState:
         # v2.6.0: E-law wall-clock decay at the TOP of step (before event evolution).
         # Shadow-only under Gate A (never touches base); writes authoritative base
         # under T3 takeover. No-op unless affect_enabled & 8-dim & real timestamp.
-        self._affect_decay(timestamp)
+        brain_owned = self._brain_capability is not None
+        if not brain_owned:
+            self._affect_decay(timestamp)
 
         if heal:
             self._tick += 1
@@ -754,7 +799,7 @@ class ScarredState:
         # (calibration memo D1: the MLP attractor image previously dominated every
         # observation point). Scar formation/healing below are untouched (they
         # read `modulated`, not base). Gated: full ∧ takeover ∧ affect ∧ 8-dim ∧ 非PEL.
-        skip_evolution = (
+        skip_evolution = brain_owned or (
             self._affect_full
             and self._affect_takeover
             and self._affect_active()
@@ -770,18 +815,20 @@ class ScarredState:
                 # weighted semantic prior (inert when absent / confidence 0).
                 x_t, surprise, a_vec, confidence = pel_ctx
                 z, _free_energy = self._pel.step(x_t, surprise, a_vec, confidence)
-                self.base = z
+                self._replace_legacy_base(z)
             else:
                 # wound/feedback step: cheap bounded affine bias on base (D-3/D-7).
-                self.base = [
-                    math.tanh(self.base[d] + _PEL_AFFINE_GAIN * modulated[d])
-                    for d in range(self.n_dims)
-                ]
+                self._replace_legacy_base(
+                    [
+                        math.tanh(self.base[d] + _PEL_AFFINE_GAIN * modulated[d])
+                        for d in range(self.n_dims)
+                    ]
+                )
         else:
             # Legacy path: 2-layer MLP with spectral normalization.
             # Multi-pass refinement: pro/max modes run multiple passes.
             for _pass in range(self._mlp_passes):
-                self.base = self._evolve_base(self.base, modulated)
+                self._replace_legacy_base(self._evolve_base(list(self.base), modulated))
 
         # v2.6.0 T-Persist: bump the dormant base version on every mutation. Gated on
         # _affect_enabled so the counter truly never moves off-flag (red-team #3-minor);
@@ -1018,18 +1065,23 @@ class ScarredState:
         *,
         pel_enabled: bool = False,
         affect_enabled: bool = False,
+        brain_capability: object | None = None,
+        authoritative_base: Sequence[float] | None = None,
     ) -> ScarredState:
         state = cls(
             n_dims=data["n_dims"],
             wound_threshold=data["wound_threshold"],
             pel_enabled=pel_enabled,
             affect_enabled=affect_enabled,
+            brain_capability=brain_capability,
+            authoritative_base=authoritative_base,
         )
         # base 的存储契约是 tanh 值域 [-1,1]（合法写入者只有 tanh 演化 / PEL 读出 /
         # E 律折返，全部有界）。复原时硬性执行该契约：损坏/手改快照的越界值在此夹回，
         # 否则会穿透 E 律衰减的凸组合前提（定理 2 需 u₀∈[0,1]）并永久越界（数学红队
         # composition fatal：base=1.5 经 decay 得 1.49…，不变集失守）。合法快照恒等。
-        state.base = [min(1.0, max(-1.0, float(x))) for x in data["base"]]
+        if brain_capability is None:
+            state._replace_legacy_base([min(1.0, max(-1.0, float(x))) for x in data["base"]])
         state.scars = [Scar.from_dict(s) for s in data.get("scars", [])]
         state._tick = data.get("tick", 0)
         state._t_raw = data.get("t_raw", 10)

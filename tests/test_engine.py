@@ -164,6 +164,34 @@ class TestEngineListeners:
         await engine.process("s1", "hello")
         assert len(received) == 1
 
+    @pytest.mark.asyncio
+    async def test_listener_survives_reset(self, engine: SylanneEngine):
+        # Regression (P0): in non-brain (default) mode, reset() must not
+        # permanently silence push-notification listeners. Non-brain
+        # notifications are all enqueued with generation 0, so a persistent
+        # generation-0 barrier used to drop every post-reset notification.
+        await engine.start()
+        received: list[str] = []
+        engine.on(lambda sid, s: received.append(sid))
+        await engine.process("s1", "hello")
+        assert len(received) == 1
+        await engine.reset("s1")
+        await engine.process("s1", "again")
+        assert len(received) == 2  # would stay 1 before the fix
+
+    @pytest.mark.asyncio
+    async def test_listener_survives_destroy(self, engine: SylanneEngine):
+        # Regression (P0): destroy() delegates to reset() in non-brain mode, so
+        # it must not silence listeners either.
+        await engine.start()
+        received: list[str] = []
+        engine.on(lambda sid, s: received.append(sid))
+        await engine.process("s1", "hello")
+        assert len(received) == 1
+        await engine.destroy("s1")
+        await engine.process("s1", "again")
+        assert len(received) == 2
+
 
 class TestEngineConfig:
     @pytest.mark.asyncio

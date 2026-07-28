@@ -16,9 +16,23 @@ Type hierarchy::
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Literal, TypedDict
 
 EngineStatus = Literal["init", "running", "degraded", "closed"]
+
+
+@dataclass(frozen=True, slots=True)
+class FeedbackReceipt:
+    """Result of applying targeted feedback to a canonical event tick."""
+
+    status: Literal["applied", "duplicate", "missed", "no_effect", "disabled", "degraded"]
+    session_id: str
+    target_tick: int
+    feedback_id: str
+    applied_dimensions: tuple[int, ...]
+    applied_synapses: int
+    mutation_seq: int
 
 
 class RhythmState(TypedDict):

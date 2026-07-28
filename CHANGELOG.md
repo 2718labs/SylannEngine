@@ -5,6 +5,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- `training/generate_data.py`：移除硬编码的 provider API 密钥，改为运行时从环境变量读取
+  （`SYLANNE_GPT55_API_KEY` / `SYLANNE_MIMO_API_KEY`），未配置的 provider 自动跳过、全未配置则报错退出。
+  原先提交的密钥已在 provider 端轮换作废，并从 git 历史与 PyPI 2.4.0 归档中清除。
+
 ## [2.6.1] — 2026-07-10
 
 ### 情感动力学（affect-dynamics，设计代号 v26）—— 首个带发布号的版本

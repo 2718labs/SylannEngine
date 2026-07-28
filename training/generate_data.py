@@ -7,7 +7,10 @@
 输出格式: JSONL, 每行 {"text": "...", "lang": "zh|en", "emotion": {...}, "meta": {...}}
 
 Usage:
-    python generate_data.py --n 10000 --output data/train.jsonl --api-key $ANTHROPIC_API_KEY
+    # Provide provider API keys via environment variables (never hardcode them):
+    export SYLANNE_GPT55_API_KEY=...   # provider api.aylovelle.top
+    export SYLANNE_MIMO_API_KEY=...    # provider token-plan-cn.xiaomimimo.com
+    python generate_data.py --n 10000 --output data/train.jsonl
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import random
 import time
 from pathlib import Path
@@ -90,12 +94,14 @@ def weighted_scenario_choice() -> str:
 # API client (multi-provider)
 # ---------------------------------------------------------------------------
 
-# Provider configs
+# Provider configs. API keys are read from environment variables at runtime —
+# NEVER hardcode credentials here (they end up in git history). Each provider
+# names the env var that holds its key; unset providers are skipped.
 PROVIDERS = [
     {
         "name": "gpt5.5",
         "base_url": "https://api.aylovelle.top/v1",
-        "api_key": "REDACTED_API_KEY",
+        "api_key_env": "SYLANNE_GPT55_API_KEY",
         "model": "gpt-5.5",
         "concurrency": 8,
         "temperature": 0.9,
@@ -104,7 +110,7 @@ PROVIDERS = [
     {
         "name": "mimo-v2.5",
         "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
-        "api_key": "REDACTED_API_KEY",
+        "api_key_env": "SYLANNE_MIMO_API_KEY",
         "model": "MiMo-V2.5",
         "concurrency": 8,
         "temperature": 0.85,
@@ -113,7 +119,7 @@ PROVIDERS = [
     {
         "name": "mimo-v2.5-pro",
         "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
-        "api_key": "REDACTED_API_KEY",
+        "api_key_env": "SYLANNE_MIMO_API_KEY",
         "model": "MiMo-V2.5-Pro",
         "concurrency": 7,
         "temperature": 0.8,
@@ -216,10 +222,14 @@ async def main():
 
     from openai import AsyncOpenAI
 
-    # Initialize all providers
+    # Initialize all providers whose API key is present in the environment.
     clients = []
     for p in PROVIDERS:
-        client_obj = AsyncOpenAI(api_key=p["api_key"], base_url=p["base_url"])
+        api_key = os.environ.get(p["api_key_env"], "")
+        if not api_key:
+            print(f"Skipping provider {p['name']}: set {p['api_key_env']} to enable it")
+            continue
+        client_obj = AsyncOpenAI(api_key=api_key, base_url=p["base_url"])
         clients.append(
             {
                 **p,
@@ -227,6 +237,9 @@ async def main():
                 "_semaphore": asyncio.Semaphore(p["concurrency"]),
             }
         )
+    if not clients:
+        required = ", ".join(sorted({p["api_key_env"] for p in PROVIDERS}))
+        raise SystemExit(f"No provider API keys found. Set at least one of: {required}")
     print(f"Providers: {', '.join(p['name'] for p in clients)}")
     print(f"Total concurrency: {sum(p['concurrency'] for p in clients)}")
 

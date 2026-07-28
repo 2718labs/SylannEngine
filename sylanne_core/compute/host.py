@@ -15,11 +15,15 @@ SylanneAlphaHost 是每个会话的顶层容器，持有：
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ..config import BrainComputeConfig
+from .brain_errors import BrainDurabilityError
+from .brain_store import BrainStateStore
 from .kernel import AlphaKernel, AlphaKernelEvent
 from .runtime import AlphaRuntime
 
@@ -39,6 +43,7 @@ class SylanneAlphaHostEvent:
     通过 to_kernel_event() 转换为 kernel 可消费的格式。
     """
 
+    event_id: str | None = None
     text: str = ""
     confidence: float = 0.0
     flags: list[str] = field(default_factory=list)
@@ -48,6 +53,7 @@ class SylanneAlphaHostEvent:
 
     def to_kernel_event(self) -> AlphaKernelEvent:
         return AlphaKernelEvent(
+            event_id=self.event_id,
             text=self.text,
             values=dict(self.values),
             confidence=self.confidence,
@@ -91,14 +97,23 @@ class SylanneAlphaHost:
     affect_slowchannel: bool = False
     affect_plasticity: bool = False
     affect_full_takeover: bool = False
+    brain_compute: BrainComputeConfig = field(default_factory=BrainComputeConfig)
+    brain_store: BrainStateStore | None = None
     runtime: AlphaRuntime = field(init=False)
     kernel: AlphaKernel = field(init=False)
     _dirty: bool = field(init=False, default=False)
     _ticks_since_flush: int = field(init=False, default=0)
     _last_flush_time: float = field(init=False, default=0.0)
     _pending_snapshot: dict[str, Any] | None = field(init=False, default=None)
+    _operation_lock: threading.RLock = field(
+        init=False,
+        default_factory=threading.RLock,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
+        if self.brain_compute.enabled and self.brain_store is None:
+            raise BrainDurabilityError("brain-enabled hosts require a shared BrainStateStore")
         self.runtime = AlphaRuntime(
             Path(self.root),
             profile=self.profile,
@@ -108,6 +123,8 @@ class SylanneAlphaHost:
             affect_slowchannel=self.affect_slowchannel,
             affect_plasticity=self.affect_plasticity,
             affect_full_takeover=self.affect_full_takeover,
+            brain_compute=self.brain_compute,
+            brain_store=self.brain_store,
         )
         self.kernel = self.runtime.load(self.session_key, legacy=self.legacy)
         self.kernel.set_telemetry(self.telemetry_sink)
@@ -180,6 +197,28 @@ class SylanneAlphaHost:
     def diagnostics(self) -> dict[str, Any]:
         return self.kernel.surface()
 
+    @property
+    def brain_state(self) -> Any | None:
+        """Return the authoritative B state for Engine validation, if enabled."""
+        return self.kernel.computation.engine.brain_state
+
+    def apply_targeted_feedback(
+        self,
+        *,
+        feedback_id: str,
+        target_tick: int,
+        value: float,
+        confidence: float,
+    ) -> dict[str, object]:
+        """Serialize one targeted feedback mutation with this host's operations."""
+        with self._operation_lock:
+            return self.kernel.computation.engine.apply_targeted_feedback(
+                feedback_id=feedback_id,
+                target_tick=target_tick,
+                value=value,
+                confidence=confidence,
+            )
+
     def snapshot(self) -> dict[str, Any]:
         return self.kernel.snapshot()
 
@@ -191,25 +230,29 @@ class SylanneAlphaHost:
         assessment: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """内部 tick 实现：转换事件 → 注入 phase flag → 驱动 kernel → CoW snapshot → 按需持久化。"""
-        host_event = self._event(event)
-        flags = list(dict.fromkeys([phase, *host_event.flags]))
-        surface: dict[str, Any] = self.kernel.tick(
-            AlphaKernelEvent(
-                text=host_event.text,
-                values=dict(host_event.values),
-                confidence=host_event.confidence,
-                flags=flags,
-                now=host_event.now,
-                event_time=dict(host_event.event_time),
-            ),
-            assessment=assessment,
-        )["surface"]
-        # CoW: take snapshot immediately (pure memory, fast)
-        self._pending_snapshot = self.kernel.snapshot()
-        self._dirty = True
-        self._ticks_since_flush += 1
-        self._maybe_flush()
-        return surface
+        with self._operation_lock:
+            host_event = self._event(event)
+            if self.brain_compute.enabled and not host_event.event_id:
+                raise ValueError("brain-enabled host events require a nonempty event_id")
+            flags = list(dict.fromkeys([phase, *host_event.flags]))
+            surface: dict[str, Any] = self.kernel.tick(
+                AlphaKernelEvent(
+                    event_id=host_event.event_id,
+                    text=host_event.text,
+                    values=dict(host_event.values),
+                    confidence=host_event.confidence,
+                    flags=flags,
+                    now=host_event.now,
+                    event_time=dict(host_event.event_time),
+                ),
+                assessment=assessment,
+            )["surface"]
+            # CoW: take snapshot immediately (pure memory, fast)
+            self._pending_snapshot = self.kernel.snapshot()
+            self._dirty = True
+            self._ticks_since_flush += 1
+            self._maybe_flush()
+            return surface
 
     def _maybe_flush(self) -> None:
         """按间隔或 tick 数阈值决定是否落盘。"""
@@ -233,6 +276,13 @@ class SylanneAlphaHost:
             self._pending_snapshot = self.kernel.snapshot()
         self._flush()
 
+    def close(self, *, flush: bool = True) -> None:
+        """Optionally persist legacy state, then release brain backend resources."""
+        with self._operation_lock:
+            if flush:
+                self.flush()
+            self.kernel.computation.engine.close()
+
     def _reply_text(self, surface: dict[str, Any]) -> str:
         """根据 decision/guard 生成简短的内置回复文本（on_chat 专用）。"""
         decision = surface["decision"]
@@ -252,6 +302,9 @@ class SylanneAlphaHost:
             return event
         payload = event or {}
         return SylanneAlphaHostEvent(
+            event_id=(
+                str(payload.get("event_id")) if payload.get("event_id") is not None else None
+            ),
             text=str(payload.get("text") or ""),
             confidence=float(payload.get("confidence") or 0.0),
             flags=list(payload.get("flags") or []),

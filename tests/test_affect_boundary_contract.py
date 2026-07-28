@@ -49,9 +49,11 @@ class TestRestoreClampsBase:
 class TestDecayEntryBelt:
     def test_poisoned_base_takeover_bounded(self) -> None:
         # from_dict 之外的假想污染源（未来 bug）：入口皮带独立兜底。
+        # 注：公开 setter `base` 现在会校验并拒绝越界值（brain 单写门加的合理硬化），
+        # 所以这里直写内部 `_base` 模拟“绕过 setter 的未来污染源”，仍验证 decay 兜底。
         st = ScarredState(n_dims=8, affect_enabled=True)
         st.set_affect_params(_TRAITS, takeover=True)
-        st.base = [1.5, -3.0, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0]
+        st._base = [1.5, -3.0, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0]
         st._e_last_wall_ts = 100.0
         st._affect_decay(200.0)
         assert all(-1.0 <= x <= 1.0 for x in st.base), st.base
