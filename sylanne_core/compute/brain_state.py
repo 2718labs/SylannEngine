@@ -31,11 +31,11 @@ _B_STATE_STORAGE_NAMES = _B_STATE_ARRAY_STORAGE_NAMES | {_B_STATE_RING_STORAGE_N
 
 
 def _record_trace_storage(record: BEligibilityRecord) -> array[float]:
-    return cast(array[float], object.__getattribute__(record, _B_RECORD_STORAGE_NAME))
+    return cast("array[float]", object.__getattribute__(record, _B_RECORD_STORAGE_NAME))
 
 
 def _state_array_storage(state: BrainState, name: str) -> array[float]:
-    return cast(array[float], object.__getattribute__(state, name))
+    return cast("array[float]", object.__getattribute__(state, name))
 
 
 def _state_ring_storage(state: BrainState) -> deque[BEligibilityRecord]:

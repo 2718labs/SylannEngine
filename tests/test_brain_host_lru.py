@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
+from functools import partial
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock
@@ -31,6 +35,29 @@ def _brain_event(surface: Surface) -> dict[str, Any]:
     event = surface["pipeline"].get("brain_event")
     assert isinstance(event, dict)
     return cast(dict[str, Any], event)
+
+
+def _route_blocking_request_to_executor(
+    monkeypatch: pytest.MonkeyPatch,
+    executor: ThreadPoolExecutor,
+    blocking_request: Callable[..., dict[str, Any]],
+) -> None:
+    default_to_thread = asyncio.to_thread
+
+    async def routed_to_thread(
+        func: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if getattr(func, "__func__", None) is blocking_request:
+            loop = asyncio.get_running_loop()
+            context = copy_context()
+            call = partial(context.run, func, *args, **kwargs)
+            return await loop.run_in_executor(executor, call)
+        return await default_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", routed_to_thread)
 
 
 @pytest.mark.asyncio
@@ -167,11 +194,13 @@ async def test_eight_host_overflow_is_hard_ceiling_and_shrinks_to_hot_limit(
 
     monkeypatch.setattr(SylanneAlphaHost, "on_request", blocking_request)
     await engine.start()
-    accepted = [
-        asyncio.create_task(engine.process(f"s{index}", "event", event_id=f"e{index}"))
-        for index in range(9)
-    ]
+    request_executor = ThreadPoolExecutor(max_workers=10)
+    _route_blocking_request_to_executor(monkeypatch, request_executor, blocking_request)
     try:
+        accepted = [
+            asyncio.create_task(engine.process(f"s{index}", "event", event_id=f"e{index}"))
+            for index in range(9)
+        ]
         loop = asyncio.get_running_loop()
         deadline = loop.time() + 5.0
         while True:
@@ -199,7 +228,10 @@ async def test_eight_host_overflow_is_hard_ceiling_and_shrinks_to_hot_limit(
         assert len(engine._hosts) <= 1
     finally:
         release.set()
-        await engine.shutdown()
+        try:
+            await engine.shutdown()
+        finally:
+            request_executor.shutdown(wait=True, cancel_futures=True)
 
 
 @pytest.mark.asyncio
@@ -231,11 +263,13 @@ async def test_overflow_shrinks_without_a_later_host_admission(
 
     monkeypatch.setattr(SylanneAlphaHost, "on_request", blocking_request)
     await engine.start()
-    tasks = [
-        asyncio.create_task(engine.process(f"s{index}", "event", event_id=f"e{index}"))
-        for index in range(9)
-    ]
+    request_executor = ThreadPoolExecutor(max_workers=10)
+    _route_blocking_request_to_executor(monkeypatch, request_executor, blocking_request)
     try:
+        tasks = [
+            asyncio.create_task(engine.process(f"s{index}", "event", event_id=f"e{index}"))
+            for index in range(9)
+        ]
         loop = asyncio.get_running_loop()
         deadline = loop.time() + 5.0
         while True:
@@ -255,7 +289,10 @@ async def test_overflow_shrinks_without_a_later_host_admission(
         assert len(engine._hosts) <= 1
     finally:
         release.set()
-        await engine.shutdown()
+        try:
+            await engine.shutdown()
+        finally:
+            request_executor.shutdown(wait=True, cancel_futures=True)
 
 
 @pytest.mark.asyncio

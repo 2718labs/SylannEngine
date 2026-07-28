@@ -146,7 +146,7 @@ def _validate_owned_float32_array(
 ) -> array[float]:
     if type(values) is not array:
         raise BrainValidationError(f"{name} must be an owned float32[{length}] array")
-    validated = cast(array[float], values)
+    validated = cast("array[float]", values)
     if validated.typecode != "f" or len(validated) != length:
         raise BrainValidationError(f"{name} must be an owned float32[{length}] array")
     for index, value in enumerate(validated):
@@ -226,11 +226,11 @@ def split_signed_input(values: Sequence[float] | Iterable[float]) -> tuple[float
 
 
 def _record_trace_storage(record: CEligibilityRecord) -> array[float]:
-    return cast(array[float], object.__getattribute__(record, _C_RECORD_STORAGE_NAME))
+    return cast("array[float]", object.__getattribute__(record, _C_RECORD_STORAGE_NAME))
 
 
 def _record_basis_storage(record: CEligibilityRecord) -> array[float]:
-    return cast(array[float], object.__getattribute__(record, _C_RECORD_BASIS_STORAGE_NAME))
+    return cast("array[float]", object.__getattribute__(record, _C_RECORD_BASIS_STORAGE_NAME))
 
 
 @dataclass(frozen=True, slots=True, init=False, eq=False, repr=False)
@@ -389,7 +389,7 @@ def _validate_owned_ring(value: object, *, horizon: int) -> deque[CEligibilityRe
 
 
 def _state_array_storage(state: BrainCState, name: str) -> array[float]:
-    return cast(array[float], object.__getattribute__(state, name))
+    return cast("array[float]", object.__getattribute__(state, name))
 
 
 def _state_ring_storage(state: BrainCState) -> deque[CEligibilityRecord]:

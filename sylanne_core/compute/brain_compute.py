@@ -193,7 +193,7 @@ _EVENT_CANDIDATE_STORAGE_NAMES = frozenset(
 
 
 def _event_candidate_array(candidate: EventCandidate, name: str) -> array[float]:
-    return cast(array[float], object.__getattribute__(candidate, name))
+    return cast("array[float]", object.__getattribute__(candidate, name))
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -383,7 +383,7 @@ def _seal_text(digest: _Digest, value: object) -> None:
 def _seal_float64x8(digest: _Digest, value: object) -> None:
     if type(value) is not array:
         raise TypeError("integrity vector has the wrong type")
-    vector = cast(array[float], value)
+    vector = cast("array[float]", value)
     if vector.typecode != "d" or len(vector) != N_B:
         raise ValueError("integrity vector must be float64[8]")
     digest.update(_SEAL_F64X8.pack(*vector))
