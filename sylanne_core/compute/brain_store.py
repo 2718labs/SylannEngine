@@ -73,8 +73,19 @@ class _FcntlModule(Protocol):
     def flock(self, file_descriptor: int, operation: int) -> None: ...
 
 
+class _MsvcrtModule(Protocol):
+    LK_NBLCK: int
+    LK_UNLCK: int
+
+    def locking(self, file_descriptor: int, mode: int, nbytes: int) -> None: ...
+
+
 def _fcntl_module() -> _FcntlModule:
     return cast(_FcntlModule, importlib.import_module("fcntl"))
+
+
+def _msvcrt_module() -> _MsvcrtModule:
+    return cast(_MsvcrtModule, importlib.import_module("msvcrt"))
 
 
 def _utf8(value: object, name: str) -> bytes:
@@ -645,8 +656,7 @@ class BrainStateStore:
                 lease.flush()
             lease.seek(0)
             if os.name == "nt":
-                import msvcrt
-
+                msvcrt = _msvcrt_module()
                 msvcrt.locking(lease.fileno(), msvcrt.LK_NBLCK, 1)
             else:  # pragma: no cover - exercised on Unix CI
                 fcntl = _fcntl_module()
@@ -665,8 +675,7 @@ class BrainStateStore:
             try:
                 lease.seek(0)
                 if os.name == "nt":
-                    import msvcrt
-
+                    msvcrt = _msvcrt_module()
                     msvcrt.locking(lease.fileno(), msvcrt.LK_UNLCK, 1)
                 else:  # pragma: no cover - exercised on Unix CI
                     fcntl = _fcntl_module()
